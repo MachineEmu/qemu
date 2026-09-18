@@ -6,5 +6,6 @@
   "targets": ["aarch64-softmmu"],
   "host_architecture": "x86_64-linux",
   "dirty_source": true,
+  "patches_applied": true,
   "status": "example-only"
 }

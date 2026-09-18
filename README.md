@@ -11,6 +11,11 @@ board model crates, `board-ffi`, and `board-tools`. Display, audio, remote
 device, and analysis crates remain in the source repository until their own
 milestones.
 
+The `unifi-10.2` fetch and build scripts now work from this checkout: the
+preflight fetched QEMU 10.2.4, applied all 11 patches, compiled `board-ffi`,
+and produced `qemu-system-aarch64`. Build outputs stay under ignored `.cache/`
+and `target/` directories.
+
 ## Independent checkout
 
 An engine build must be reproducible from this checkout and its declared inputs.

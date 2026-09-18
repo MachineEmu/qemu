@@ -15,8 +15,8 @@ version = "10.2.4"
 verification = "immutable-git-commit"
 
 [toolchain]
-build_script = "scripts/legacy/build.sh"
-fetch_script = "scripts/legacy/fetch.sh"
+build_script = "scripts/build-unifi-10.2.sh"
+fetch_script = "scripts/fetch-unifi-10.2.sh"
 
 [compatibility]
 machines = ["udm-pro", "us24pro", "mt7981"]
