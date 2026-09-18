@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "track_id": "unifi-10.2",
+  "source_revision": "3e0bcba1ca7d6607ca49a988d165f052a3a53323",
+  "patches": [],
+  "targets": ["aarch64-softmmu"],
+  "host_architecture": "x86_64-linux",
+  "dirty_source": true,
+  "status": "example-only"
+}
