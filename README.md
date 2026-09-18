@@ -3,6 +3,9 @@
 This repository owns pinned QEMU sources, engine tracks, ordered patches,
 custom machines, QEMU-side helpers, and engine-build provenance.
 
+MachineEmu-owned code is currently licensed under AGPL-3.0-or-later. Imported
+QEMU and third-party components retain their upstream licenses and notices.
+
 ## Independent checkout
 
 An engine build must be reproducible from this checkout and its declared inputs.
