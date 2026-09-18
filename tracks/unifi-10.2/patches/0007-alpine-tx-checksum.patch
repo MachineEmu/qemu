@@ -1,0 +1,62 @@
+diff --git a/hw/net/e1000.c b/hw/net/e1000.c
+index 469a9244..d1ec5324 100644
+--- a/hw/net/e1000.c
++++ b/hw/net/e1000.c
+@@ -1084,6 +1084,9 @@ e1000_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+         }
+         pci_dma_write(PCI_DEVICE(s), le64_to_cpu(desc.buf1_ptr), buf, size);
+         comp_addr = s->alpine_rx_comp_base + idx * sizeof(comp);
++        /* Preserve the producer's two-bit ring generation after wraparound. */
++        comp.ctrl_meta = cpu_to_le32((le32_to_cpu(desc.len_ctrl) & 0x03000000U) |
++                                     (1U << 30) | (1U << 26) | (1U << 27));
+         pci_dma_write(PCI_DEVICE(s), comp_addr, &comp, sizeof(comp));
+         s->alpine_rx_head++;
+         s->alpine_rx_comp_head = s->alpine_rx_head;
+@@ -1411,7 +1414,11 @@ e1000_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+         size_t packet_len = 0;
+         uint32_t count = val & 0x00ffffffU;
+         uint32_t i;
++        int checksum_flags = 0;
+ 
++        if (!s->alpine_tx_desc_len || count > s->alpine_tx_desc_len) {
++            return;
++        }
+         for (i = 0; i < count; i++) {
+             struct {
+                 uint32_t len_ctrl;
+@@ -1422,15 +1429,33 @@ e1000_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                            ((s->alpine_tx_desc_len ? s->alpine_tx_desc_len : 1) - 1);
+             pci_dma_read(PCI_DEVICE(s), s->alpine_tx_desc_base + idx * sizeof(desc),
+                          &desc, sizeof(desc));
++            desc.len_ctrl = le32_to_cpu(desc.len_ctrl);
++            desc.meta_ctrl = le32_to_cpu(desc.meta_ctrl);
++            desc.buf_ptr = le64_to_cpu(desc.buf_ptr);
++            if (!(desc.len_ctrl & (1U << 23))) {
++                /* Data-descriptor bits 13/14 request IPv4/L4 checksums. */
++                if (desc.meta_ctrl & (1U << 13)) {
++                    checksum_flags |= CSUM_IP;
++                }
++                if (desc.meta_ctrl & (1U << 14)) {
++                    checksum_flags |= CSUM_TCP | CSUM_UDP;
++                }
++            }
+             if (!(desc.len_ctrl & (1U << 23)) && desc.buf_ptr &&
+                 packet_len + (desc.len_ctrl & 0xfffffU) <= sizeof(packet)) {
+                 uint32_t len = desc.len_ctrl & 0xfffffU;
+                 pci_dma_read(PCI_DEVICE(s), desc.buf_ptr, packet + packet_len, len);
+                 packet_len += len;
+             }
++            if (desc.len_ctrl & (1U << 27)) {
++                if (packet_len) {
++                    net_checksum_calculate(packet, packet_len, checksum_flags);
++                    e1000_send_packet(s, packet, packet_len);
++                }
++                packet_len = 0;
++                checksum_flags = 0;
++            }
+         }
+-        if (packet_len)
+-            e1000_send_packet(s, packet, packet_len);
+         s->alpine_tx_head += count;
+         s->alpine_tx_comp_head = s->alpine_tx_head;
+         msix_notify(PCI_DEVICE(s), 7);

@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-re <unifi-re@localhost>
+Date: Thu, 10 Sep 2026 00:00:00 +0000
+Subject: [PATCH] UDM Pro: model two-port AHCI with staggered spin-up and no MSI
+---
+ hw/ide/ahci.c             | 3 ++-
+ hw/ide/ich.c              | 16 +++++++++++++++-
+ include/hw/ide/ahci-pci.h | 1 +
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/hw/ide/ahci.c b/hw/ide/ahci.c
+index 14bc66fb7f..1efa790b53 100644
+--- a/hw/ide/ahci.c
++++ b/hw/ide/ahci.c
+@@ -548,7 +548,8 @@ static void ahci_reg_init(AHCIState *s)
+     s->control_regs.cap = (s->ports - 1) |
+                           (AHCI_NUM_COMMAND_SLOTS << 8) |
+                           (AHCI_SUPPORTED_SPEED_GEN1 << AHCI_SUPPORTED_SPEED) |
+-                          HOST_CAP_NCQ | HOST_CAP_AHCI | HOST_CAP_64;
++                          HOST_CAP_NCQ | HOST_CAP_AHCI | HOST_CAP_SSS |
++                          HOST_CAP_64;
+ 
+     s->control_regs.impl = (1 << s->ports) - 1;
+ 
+diff --git a/hw/ide/ich.c b/hw/ide/ich.c
+index b00987f08d..612d065245 100644
+--- a/hw/ide/ich.c
++++ b/hw/ide/ich.c
+@@ -128,7 +128,8 @@ static void pci_ich9_ahci_realize(PCIDevice *dev, Error **errp)
+     d = ICH9_AHCI(dev);
+     int ret;
+ 
+-    d->ahci.ports = 6;
++    /* UDM Pro's Alpine SATA controller exposes two physical ports. */
++    d->ahci.ports = 2;
+     ahci_realize(&d->ahci, DEVICE(dev), pci_get_address_space(dev));
+ 
+     pci_config_set_prog_interface(dev->config, AHCI_PROGMODE_MAJOR_REV_1);
+@@ -161,7 +162,8 @@ static void pci_ich9_ahci_realize(PCIDevice *dev, Error **errp)
+     /* Although the AHCI 1.3 specification states that the first capability
+      * should be PMCAP, the Intel ICH9 data sheet specifies that the ICH9
+      * AHCI device puts the MSI capability first, pointing to 0x80. */
+-    ret = msi_init(dev, ICH9_MSI_CAP_OFFSET, 1, true, false, NULL);
++    ret = d->msi_off ? -ENOTSUP :
++        msi_init(dev, ICH9_MSI_CAP_OFFSET, 1, true, false, NULL);
+     /* Any error other than -ENOTSUP(board's MSI support is broken)
+      * is a programming error.  Fall back to INTx silently on -ENOTSUP */
+     assert(!ret || ret == -ENOTSUP);
+@@ -176,6 +178,10 @@ static void pci_ich9_uninit(PCIDevice *dev)
+     ahci_uninit(&d->ahci);
+ }
+ 
++static const Property ich9_ahci_properties[] = {
++    DEFINE_PROP_BOOL("msi-off", AHCIPCIState, msi_off, false),
++};
++
+ static void ich_ahci_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -187,6 +193,7 @@ static void ich_ahci_class_init(ObjectClass *klass, const void *data)
+     k->device_id = PCI_DEVICE_ID_INTEL_82801IR;
+     k->revision = 0x02;
+     k->class_id = PCI_CLASS_STORAGE_SATA;
++    device_class_set_props(dc, ich9_ahci_properties);
+     dc->vmsd = &vmstate_ich9_ahci;
+     device_class_set_legacy_reset(dc, pci_ich9_reset);
+     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+diff --git a/include/hw/ide/ahci-pci.h b/include/hw/ide/ahci-pci.h
+index face1a9a4a..3576756462 100644
+--- a/include/hw/ide/ahci-pci.h
++++ b/include/hw/ide/ahci-pci.h
+@@ -19,6 +19,7 @@ struct AHCIPCIState {
+ 
+     AHCIState ahci;
+     IRQState irq;
++    bool msi_off;
+ };
+ 
+ #endif
+-- 
+2.45.2

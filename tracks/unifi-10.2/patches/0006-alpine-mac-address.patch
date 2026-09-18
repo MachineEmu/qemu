@@ -1,0 +1,35 @@
+diff --git a/hw/net/e1000.c b/hw/net/e1000.c
+--- a/hw/net/e1000.c
++++ b/hw/net/e1000.c
+@@ -409,3 +409,13 @@
+     memset(d->mac_reg, 0, sizeof d->mac_reg);
+     memcpy(d->mac_reg, mac_reg_init, sizeof mac_reg_init);
++    if (!strcmp(object_get_typename(OBJECT(d)), "alpine-eth-pci")) {
++        const uint8_t *mac = d->conf.macaddr.a;
++
++        /* Alpine EC forwarding table entry zero, not Intel RAL/RAH. */
++        d->mac_reg[0x868 / 4] = ((uint32_t)mac[2] << 24) |
++                                ((uint32_t)mac[3] << 16) |
++                                ((uint32_t)mac[4] << 8) | mac[5];
++        d->mac_reg[0x86c / 4] = ((uint32_t)mac[0] << 8) | mac[1];
++    }
++
+     d->rxbuf_min_shift = 1;
+@@ -1335,3 +1345,8 @@
+     unsigned int index = (addr & 0x1ffff) >> 2;
+ 
++    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
++        size == 4 && (addr == 0x868 || addr == 0x86c)) {
++        s->mac_reg[index] = val;
++        return;
++    }
+     if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+@@ -1452,3 +1467,8 @@
+     unsigned int index = (addr & 0x1ffff) >> 2;
+ 
++    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
++        size == 4 && (addr == 0x868 || addr == 0x86c)) {
++        return s->mac_reg[index];
++    }
++
+     /* Alpine's integrated al_eth probe expects board parameters in the

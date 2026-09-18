@@ -1,0 +1,461 @@
+--- a/hw/net/e1000.c
++++ b/hw/net/e1000.c
+@@ -28,8 +28,6 @@
+ #include "qemu/osdep.h"
+ #include "hw/net/mii.h"
+ #include "hw/pci/pci_device.h"
+-#include "hw/pci/msi.h"
+-#include "hw/pci/msix.h"
+ #include "hw/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "net/eth.h"
+@@ -88,30 +86,10 @@
+     NICConf conf;
+     MemoryRegion mmio;
+     MemoryRegion io;
+-    /* Alpine's PCI function exposes separate UDMA and auxiliary windows.
+-     * Reuse the deterministic register backend until those blocks are split
+-     * into their native models. */
+-    MemoryRegion alpine_bar2;
+-    MemoryRegion alpine_bar3;
+-    MemoryRegion alpine_bar4;
+ 
+     uint32_t mac_reg[0x8000];
+     uint16_t phy_reg[0x20];
+     uint16_t eeprom_data[64];
+-
+-    /* Alpine has four independent M2S rings, selected by the guest CPU.
+-     * The vendor driver uses each TX queue's
+-     * descriptor head/tail registers directly rather than the E1000 rings. */
+-    uint64_t alpine_tx_desc_base[4];
+-    uint32_t alpine_tx_desc_len[4];
+-    uint32_t alpine_tx_head[4];
+-    uint32_t alpine_tx_comp_head[4];
+-    uint64_t alpine_rx_desc_base;
+-    uint64_t alpine_rx_comp_base;
+-    uint32_t alpine_rx_desc_len;
+-    uint32_t alpine_rx_head;
+-    uint32_t alpine_rx_comp_head;
+-    uint32_t alpine_rx_posted;
+ 
+     uint32_t rxbuf_size;
+     uint32_t rxbuf_min_shift;
+@@ -161,24 +139,6 @@
+ };
+ typedef struct E1000State_st E1000State;
+ 
+-/* Alpine ports share a small in-process L2 fabric representing RTL8370. */
+-static GList *alpine_eth_devices;
+-static bool alpine_fabric_forwarding;
+-
+-static void alpine_switch_flood(E1000State *source, const uint8_t *buf,
+-                                int size)
+-{
+-    if (alpine_fabric_forwarding)
+-        return;
+-    alpine_fabric_forwarding = true;
+-    for (GList *entry = alpine_eth_devices; entry != NULL; entry = entry->next) {
+-        E1000State *peer = entry->data;
+-        if (peer != source)
+-            qemu_receive_packet(qemu_get_queue(peer->nic), buf, size);
+-    }
+-    alpine_fabric_forwarding = false;
+-}
+-
+ #define chkflag(x)     (s->compat_flags & E1000_FLAG_##x)
+ 
+ struct E1000BaseClass {
+@@ -428,16 +388,6 @@
+     d->phy_reg[MII_PHYID2] = edc->phy_id2;
+     memset(d->mac_reg, 0, sizeof d->mac_reg);
+     memcpy(d->mac_reg, mac_reg_init, sizeof mac_reg_init);
+-    if (!strcmp(object_get_typename(OBJECT(d)), "alpine-eth-pci")) {
+-        const uint8_t *mac = d->conf.macaddr.a;
+-
+-        /* Alpine EC forwarding table entry zero, not Intel RAL/RAH. */
+-        d->mac_reg[0x868 / 4] = ((uint32_t)mac[2] << 24) |
+-                                ((uint32_t)mac[3] << 16) |
+-                                ((uint32_t)mac[4] << 8) | mac[5];
+-        d->mac_reg[0x86c / 4] = ((uint32_t)mac[0] << 8) | mac[1];
+-    }
+-
+     d->rxbuf_min_shift = 1;
+     memset(&d->tx, 0, sizeof d->tx);
+ 
+@@ -613,11 +563,6 @@
+         qemu_receive_packet(nc, buf, size);
+     } else {
+         qemu_send_packet(nc, buf, size);
+-        qemu_flush_queued_packets(nc);
+-        if (nc->peer)
+-            qemu_flush_queued_packets(nc->peer);
+-        if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci"))
+-            alpine_switch_flood(s, buf, size);
+     }
+     inc_tx_bcast_or_mcast_count(s, buf);
+     e1000x_increase_size_stats(s->mac_reg, PTCregs, size + 4);
+@@ -902,12 +847,6 @@
+ e1000_can_receive(NetClientState *nc)
+ {
+     E1000State *s = qemu_get_nic_opaque(nc);
+-
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci")) {
+-        bool ready = s->alpine_rx_desc_base && s->alpine_rx_comp_base &&
+-                     s->alpine_rx_desc_len && s->alpine_rx_posted;
+-        return ready;
+-    }
+ 
+     return e1000x_rx_ready(&s->parent_obj, s->mac_reg) &&
+         e1000_has_rxbufs(s, 1) && !timer_pending(s->flush_queue_timer);
+@@ -1073,51 +1012,6 @@
+ static ssize_t
+ e1000_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+ {
+-    E1000State *s = qemu_get_nic_opaque(nc);
+-
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci")) {
+-        alpine_switch_flood(s, buf, size);
+-        struct {
+-            uint32_t len_ctrl;
+-            uint32_t buf2_ptr_lo;
+-            uint64_t buf1_ptr;
+-        } desc;
+-        uint32_t idx;
+-        uint64_t desc_addr;
+-        uint64_t comp_addr;
+-        struct {
+-            uint32_t ctrl_meta;
+-            uint32_t len;
+-            uint32_t word2;
+-            uint32_t word3;
+-        } comp = {
+-            .ctrl_meta = cpu_to_le32((1U << 30) | (1U << 26) |
+-                                     (1U << 27) | (1U << 24)),
+-            .len = cpu_to_le32(size),
+-        };
+-
+-        if (!s->alpine_rx_desc_base || !s->alpine_rx_comp_base ||
+-            !s->alpine_rx_desc_len || !s->alpine_rx_posted)
+-            return -1;
+-        idx = s->alpine_rx_head & (s->alpine_rx_desc_len - 1);
+-        desc_addr = s->alpine_rx_desc_base + idx * sizeof(desc);
+-        pci_dma_read(PCI_DEVICE(s), desc_addr, &desc, sizeof(desc));
+-        if (!le64_to_cpu(desc.buf1_ptr) || size > (le32_to_cpu(desc.len_ctrl) & 0xffff)) {
+-            return -1;
+-        }
+-        pci_dma_write(PCI_DEVICE(s), le64_to_cpu(desc.buf1_ptr), buf, size);
+-        comp_addr = s->alpine_rx_comp_base + idx * sizeof(comp);
+-        /* Preserve the producer's two-bit ring generation after wraparound. */
+-        comp.ctrl_meta = cpu_to_le32((le32_to_cpu(desc.len_ctrl) & 0x03000000U) |
+-                                     (1U << 30) | (1U << 26) | (1U << 27));
+-        pci_dma_write(PCI_DEVICE(s), comp_addr, &comp, sizeof(comp));
+-        s->alpine_rx_posted--;
+-        s->alpine_rx_head++;
+-        s->alpine_rx_comp_head = s->alpine_rx_head;
+-        msix_notify(PCI_DEVICE(s), 3);
+-        return size;
+-    }
+-
+     const struct iovec iov = {
+         .iov_base = (uint8_t *)buf,
+         .iov_len = size
+@@ -1369,135 +1263,6 @@
+ {
+     E1000State *s = opaque;
+     unsigned int index = (addr & 0x1ffff) >> 2;
+-    unsigned int txq = (addr >= 0x1000 && addr < 0x5000) ?
+-                       (addr - 0x1000) >> 12 : 0;
+-    hwaddr txreg = (addr >= 0x1000 && addr < 0x5000) ?
+-                   0x1000 + (addr & 0xfff) : addr;
+-
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && (addr == 0x868 || addr == 0x86c)) {
+-        s->mac_reg[index] = val;
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && txreg == 0x1028) {
+-        s->alpine_tx_desc_base[txq] = (s->alpine_tx_desc_base[txq] & UINT64_C(0xffffffff00000000)) |
+-                                 (val & 0xfffffff0U);
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && txreg == 0x102c) {
+-        s->alpine_tx_desc_base[txq] = (s->alpine_tx_desc_base[txq] & UINT64_C(0xffffffff)) |
+-                                 ((uint64_t)val << 32);
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && txreg == 0x1030) {
+-        s->alpine_tx_desc_len[txq] = val & 0x00ffffffU;
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && txreg == 0x1020 && val == 0) {
+-        s->alpine_tx_head[txq] = 0;
+-        s->alpine_tx_comp_head[txq] = 0;
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && addr == 0x11028) {
+-        /* Programming a new descriptor ring resets its hardware pointers. */
+-        s->alpine_rx_head = 0;
+-        s->alpine_rx_comp_head = 0;
+-        s->alpine_rx_posted = 0;
+-        s->alpine_rx_desc_base = (s->alpine_rx_desc_base & UINT64_C(0xffffffff00000000)) |
+-                                 (val & 0xfffffff0U);
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && addr == 0x1102c) {
+-        s->alpine_rx_desc_base = (s->alpine_rx_desc_base & UINT64_C(0xffffffff)) |
+-                                 ((uint64_t)val << 32);
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && addr == 0x11030) {
+-        /* DRL is a descriptor count, just like the M2S ring. */
+-        s->alpine_rx_desc_len = val & 0x00ffffffU;
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && addr == 0x11044) {
+-        s->alpine_rx_comp_base = (s->alpine_rx_comp_base & UINT64_C(0xffffffff00000000)) |
+-                                 (val & 0xfffffff0U);
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && addr == 0x11048) {
+-        s->alpine_rx_comp_base = (s->alpine_rx_comp_base & UINT64_C(0xffffffff)) |
+-                                 ((uint64_t)val << 32);
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && addr == 0x11038 && val != 0) {
+-        s->alpine_rx_posted += MIN(val & 0x00ffffffU,
+-            s->alpine_rx_desc_len - MIN(s->alpine_rx_posted, s->alpine_rx_desc_len));
+-        qemu_flush_queued_packets(qemu_get_queue(s->nic));
+-        return;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && txreg == 0x1038 && val != 0) {
+-        uint8_t packet[65536];
+-        size_t packet_len = 0;
+-        uint32_t count = val & 0x00ffffffU;
+-        uint32_t i;
+-        int checksum_flags = 0;
+-
+-        if (!s->alpine_tx_desc_len[txq] || count > s->alpine_tx_desc_len[txq]) {
+-            return;
+-        }
+-        for (i = 0; i < count; i++) {
+-            struct {
+-                uint32_t len_ctrl;
+-                uint32_t meta_ctrl;
+-                uint64_t buf_ptr;
+-            } desc;
+-            uint32_t idx = (s->alpine_tx_head[txq] + i) &
+-                           ((s->alpine_tx_desc_len[txq] ? s->alpine_tx_desc_len[txq] : 1) - 1);
+-            pci_dma_read(PCI_DEVICE(s), s->alpine_tx_desc_base[txq] + idx * sizeof(desc),
+-                         &desc, sizeof(desc));
+-            desc.len_ctrl = le32_to_cpu(desc.len_ctrl);
+-            desc.meta_ctrl = le32_to_cpu(desc.meta_ctrl);
+-            desc.buf_ptr = le64_to_cpu(desc.buf_ptr);
+-            if (!(desc.len_ctrl & (1U << 23))) {
+-                /* Data-descriptor bits 13/14 request IPv4/L4 checksums. */
+-                if (desc.meta_ctrl & (1U << 13)) {
+-                    checksum_flags |= CSUM_IP;
+-                }
+-                if (desc.meta_ctrl & (1U << 14)) {
+-                    checksum_flags |= CSUM_TCP | CSUM_UDP;
+-                }
+-            }
+-            if (!(desc.len_ctrl & (1U << 23)) && desc.buf_ptr &&
+-                packet_len + (desc.len_ctrl & 0xfffffU) <= sizeof(packet)) {
+-                uint32_t len = desc.len_ctrl & 0xfffffU;
+-                pci_dma_read(PCI_DEVICE(s), desc.buf_ptr, packet + packet_len, len);
+-                packet_len += len;
+-            }
+-            if (desc.len_ctrl & (1U << 27)) {
+-                if (packet_len) {
+-                    net_checksum_calculate(packet, packet_len, checksum_flags);
+-                    e1000_send_packet(s, packet, packet_len);
+-                }
+-                packet_len = 0;
+-                checksum_flags = 0;
+-            }
+-        }
+-        s->alpine_tx_head[txq] += count;
+-        s->alpine_tx_comp_head[txq] = s->alpine_tx_head[txq];
+-        msix_notify(PCI_DEVICE(s), 7 + txq);
+-        pci_set_irq(PCI_DEVICE(s), 1);
+-        pci_set_irq(PCI_DEVICE(s), 0);
+-        return;
+-    }
+ 
+     if (index < NWRITEOPS && macreg_writeops[index]) {
+         if (!(mac_reg_access[index] & MAC_ACCESS_FLAG_NEEDED)
+@@ -1525,44 +1290,6 @@
+ {
+     E1000State *s = opaque;
+     unsigned int index = (addr & 0x1ffff) >> 2;
+-    unsigned int txq = (addr >= 0x1000 && addr < 0x5000) ?
+-                       (addr - 0x1000) >> 12 : 0;
+-    hwaddr txreg = (addr >= 0x1000 && addr < 0x5000) ?
+-                   0x1000 + (addr & 0xfff) : addr;
+-
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && (addr == 0x868 || addr == 0x86c)) {
+-        return s->mac_reg[index];
+-    }
+-
+-    /* Alpine's integrated al_eth probe expects board parameters in the
+-     * 1G-MAC scratch register at BAR0+0x4. */
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        addr == 0x4) {
+-        return 1U | (0x11U << 5) | (1U << 11) | (1U << 29);
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        addr == 0x220) {
+-        /* PF snoop initialization verifies the AXI cache attributes. */
+-        return 0x3ff;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        addr == 0x91c) {
+-        /* al_eth_link_status_get() reads gen.rgmii_stat and uses bit 4
+-         * as the RGMII link indication.  The emulated NIC backend is
+-         * connected, so expose a stable 1-Gb/s carrier. */
+-        return 1U << 4;
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && (txreg == 0x1034 || txreg == 0x103c ||
+-                      txreg == 0x1040 || txreg == 0x104c)) {
+-        return s->alpine_tx_comp_head[txq];
+-    }
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        size == 4 && (addr == 0x11034 || addr == 0x11040 ||
+-                      addr == 0x1104c)) {
+-        return s->alpine_rx_comp_head;
+-    }
+ 
+     if (index < NREADOPS && macreg_readops[index]) {
+         if (!(mac_reg_access[index] & MAC_ACCESS_FLAG_NEEDED)
+@@ -1856,11 +1583,6 @@
+ 
+     memory_region_init_io(&d->mmio, OBJECT(d), &e1000_mmio_ops, d,
+                           "e1000-mmio", PNPMMIO_SIZE);
+-    memory_region_init_io(&d->alpine_bar2, OBJECT(d), &e1000_mmio_ops, d,
+-                          "alpine-eth-udma", PNPMMIO_SIZE);
+-    memory_region_init(&d->alpine_bar3, OBJECT(d), "alpine-eth-msix", 0x2000);
+-    memory_region_init_io(&d->alpine_bar4, OBJECT(d), &e1000_mmio_ops, d,
+-                          "alpine-eth-aux", PNPMMIO_SIZE);
+     memory_region_add_coalescing(&d->mmio, 0, excluded_regs[0]);
+     for (i = 0; excluded_regs[i] != PNPMMIO_SIZE; i++)
+         memory_region_add_coalescing(&d->mmio, excluded_regs[i] + 4,
+@@ -1884,9 +1606,7 @@
+     .size = sizeof(NICState),
+     .can_receive = e1000_can_receive,
+     .receive = e1000_receive,
+-    /* Keep the scalar callback selected so alpine-eth-pci reaches its
+-     * Alpine UDMA RX implementation in e1000_receive(). */
+-    .receive_iov = NULL,
++    .receive_iov = e1000_receive_iov,
+     .link_status_changed = e1000_set_link_status,
+ };
+ 
+@@ -1896,11 +1616,6 @@
+     E1000State *s = E1000(pci_dev);
+ 
+     pci_default_write_config(pci_dev, address, val, len);
+-
+-    if (!strcmp(object_get_typename(OBJECT(s)), "alpine-eth-pci") &&
+-        msix_present(pci_dev)) {
+-        msix_write_config(pci_dev, address, val, len);
+-    }
+ 
+     if (range_covers_byte(address, len, PCI_COMMAND) &&
+         (pci_dev->config[PCI_COMMAND] & PCI_COMMAND_MASTER)) {
+@@ -1927,23 +1642,6 @@
+     e1000_mmio_setup(d);
+ 
+     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
+-
+-    pci_register_bar(pci_dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY,
+-                     &d->alpine_bar2);
+-    pci_register_bar(pci_dev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY,
+-                     &d->alpine_bar4);
+-
+-    if (!strcmp(object_get_typename(OBJECT(d)), "alpine-eth-pci")) {
+-        /* One management vector is sufficient for the first netdev
+-         * milestone.  Use a dedicated PCI BAR for MSI-X. */
+-        int rc = msix_init_exclusive_bar(pci_dev, 32, 3, NULL);
+-        if (rc < 0) {
+-            error_setg(errp, "failed to initialize Alpine MSI-X: %d", rc);
+-            return;
+-        }
+-        for (unsigned int vector = 0; vector < 32; vector++)
+-            msix_vector_use(pci_dev, vector);
+-    }
+ 
+     pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &d->io);
+ 
+@@ -1959,8 +1657,6 @@
+     d->nic = qemu_new_nic(&net_e1000_info, &d->conf,
+                           object_get_typename(OBJECT(d)), dev->id,
+                           &dev->mem_reentrancy_guard, d);
+-    if (!strcmp(object_get_typename(OBJECT(d)), "alpine-eth-pci"))
+-        alpine_eth_devices = g_list_append(alpine_eth_devices, d);
+ 
+     qemu_format_nic_info_str(qemu_get_queue(d->nic), macaddr);
+ 
+@@ -1980,7 +1676,6 @@
+ 
+ typedef struct E1000Info {
+     const char *name;
+-    uint16_t   vendor_id;
+     uint16_t   device_id;
+     uint8_t    revision;
+     uint16_t   phy_id2;
+@@ -1997,7 +1692,7 @@
+     k->realize = pci_e1000_realize;
+     k->exit = pci_e1000_uninit;
+     k->romfile = "efi-e1000.rom";
+-    k->vendor_id = info->vendor_id;
++    k->vendor_id = PCI_VENDOR_ID_INTEL;
+     k->device_id = info->device_id;
+     k->revision = info->revision;
+     e->phy_id2 = info->phy_id2;
+@@ -2033,33 +1728,22 @@
+ static const E1000Info e1000_devices[] = {
+     {
+         .name      = "e1000",
+-        .vendor_id = PCI_VENDOR_ID_INTEL,
+         .device_id = E1000_DEV_ID_82540EM,
+         .revision  = 0x03,
+         .phy_id2   = E1000_PHY_ID2_8254xx_DEFAULT,
+     },
+     {
+         .name      = "e1000-82544gc",
+-        .vendor_id = PCI_VENDOR_ID_INTEL,
+         .device_id = E1000_DEV_ID_82544GC_COPPER,
+         .revision  = 0x03,
+         .phy_id2   = E1000_PHY_ID2_82544x,
+     },
+     {
+         .name      = "e1000-82545em",
+-        .vendor_id = PCI_VENDOR_ID_INTEL,
+         .device_id = E1000_DEV_ID_82545EM_COPPER,
+         .revision  = 0x03,
+         .phy_id2   = E1000_PHY_ID2_8254xx_DEFAULT,
+     },
+-    {
+-        /* Probe-only Alpine V2 compatibility function. */
+-        .name      = "alpine-eth-pci",
+-        .vendor_id = 0x1c36,
+-        .device_id = 0x0001,
+-        .revision  = 0x02,
+-        .phy_id2   = E1000_PHY_ID2_8254xx_DEFAULT,
+-    },
+ };
+ 
+ static void e1000_register_types(void)

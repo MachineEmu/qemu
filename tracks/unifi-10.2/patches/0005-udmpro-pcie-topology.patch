@@ -1,0 +1,36 @@
+diff --git a/hw/pci-host/gpex.c b/hw/pci-host/gpex.c
+--- a/hw/pci-host/gpex.c
++++ b/hw/pci-host/gpex.c
+@@ -151,11 +151,14 @@
+-    pci->bus = pci_register_root_bus(dev, "pcie.0", gpex_set_irq,
++    pci->bus = pci_register_root_bus(dev,
++                                     s->bus_name ? s->bus_name : "pcie.0",
++                                     gpex_set_irq,
+                                      gpex_swizzle_map_irq_fn,
+                                      s, &s->io_mmio, &s->io_ioport, 0,
+                                      s->num_irqs, TYPE_PCIE_BUS);
+ 
+     pci_bus_set_route_irq_fn(pci->bus, gpex_route_intx_pin_to_irq);
++    qdev_prop_set_int32(DEVICE(&s->gpex_root), "addr", PCI_DEVFN(s->root_slot, 0));
+     qdev_realize(DEVICE(&s->gpex_root), BUS(pci->bus), &error_fatal);
+ }
+ 
+ static void gpex_host_unrealize(DeviceState *dev)
+ {
+@@ -180,3 +183,5 @@
+     DEFINE_PROP_BOOL("allow-unmapped-accesses", GPEXHost,
+                      allow_unmapped_accesses, true),
++    DEFINE_PROP_UINT8("root-slot", GPEXHost, root_slot, 0),
++    DEFINE_PROP_STRING("bus-name", GPEXHost, bus_name),
+     DEFINE_PROP_UINT64(PCI_HOST_ECAM_BASE, GPEXHost, gpex_cfg.ecam.base, 0),
+diff --git a/include/hw/pci-host/gpex.h b/include/hw/pci-host/gpex.h
+--- a/include/hw/pci-host/gpex.h
++++ b/include/hw/pci-host/gpex.h
+@@ -64,5 +64,7 @@
+     uint8_t num_irqs;
+ 
+     bool allow_unmapped_accesses;
++    uint8_t root_slot;
++    char *bus_name;
+ 
+     struct GPEXConfig gpex_cfg;

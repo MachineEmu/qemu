@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 2026
+From: UniFi reverse engineering <noreply@example.invalid>
+Subject: [PATCH] gpex: disable incompatible child migration state for multi-host machines
+
+The standalone UDM Pro machine creates two generic PCIe host bridges. Their
+synthetic root devices do not yet have a supported migration ABI.
+
+---
+ hw/pci-host/gpex.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/hw/pci-host/gpex.c b/hw/pci-host/gpex.c
+index 5fca7e39fb..0000000000 100644
+--- a/hw/pci-host/gpex.c
++++ b/hw/pci-host/gpex.c
+@@ -245,4 +245,3 @@ static void gpex_root_class_init(ObjectClass *klass, const void *data)
+     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
+     dc->desc = "QEMU generic PCIe host bridge";
+-    dc->vmsd = &vmstate_gpex_root;
+     k->vendor_id = PCI_VENDOR_ID_REDHAT;
+-- 
+2.45.2

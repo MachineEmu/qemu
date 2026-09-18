@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniFi reverse engineering <noreply@example.invalid>
+Date: Thu, 10 Sep 2026 00:00:00 +0200
+Subject: [PATCH] meson: add repository UniFi board hook
+
+---
+ hw/meson.build   | 1 +
+ meson.build      | 3 +++
+ meson_options.txt | 3 +++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/hw/meson.build b/hw/meson.build
+index 1022bdb806..b63581dd76 100644
+--- a/hw/meson.build
++++ b/hw/meson.build
+@@ -43,6 +43,7 @@ subdir('ipmi')
+ subdir('isa')
+ subdir('mem')
+ subdir('misc')
++subdir('unifi')
+ subdir('net')
+ subdir('nubus')
+ subdir('nvme')
+diff --git a/meson.build b/meson.build
+index 7ae0d109ab..1f405ae28f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -839,6 +839,9 @@ coref = []
+ iokit = []
+ pvg = not_found
+ emulator_link_args = []
++if get_option('unifi_board_lib') != ''
++  emulator_link_args += get_option('unifi_board_lib')
++endif
+ midl = not_found
+ widl = not_found
+ pathcch = not_found
+diff --git a/meson_options.txt b/meson_options.txt
+index 2836156257..7b02f83d49 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -390,3 +390,6 @@ option('rust', type: 'feature', value: 'disabled',
+        description: 'Rust support')
+ option('strict_rust_lints', type: 'boolean', value: false,
+        description: 'Enable stricter set of Rust warnings')
++
++option('unifi_board_lib', type : 'string', value : '',
++       description: 'static library containing repository UniFi board models')
+-- 
+2.45.2

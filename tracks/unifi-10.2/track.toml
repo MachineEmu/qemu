@@ -4,6 +4,9 @@ engine = "qemu"
 status = "experimental"
 targets = ["aarch64-softmmu"]
 features = ["unifi-machines", "rust-board-ffi"]
+patch_series = "series"
+patch_root = "patches"
+integration_root = "integration/hw/unifi"
 
 [source]
 url = "https://gitlab.com/qemu-project/qemu.git"
@@ -12,8 +15,8 @@ version = "10.2.4"
 verification = "immutable-git-commit"
 
 [toolchain]
-build_script = "scripts/build.sh"
-fetch_script = "scripts/fetch.sh"
+build_script = "scripts/legacy/build.sh"
+fetch_script = "scripts/legacy/fetch.sh"
 
 [compatibility]
 machines = ["udm-pro", "us24pro", "mt7981"]

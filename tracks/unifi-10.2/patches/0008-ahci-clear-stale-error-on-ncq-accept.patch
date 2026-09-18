@@ -1,0 +1,18 @@
+--- a/hw/ide/ahci.c
++++ b/hw/ide/ahci.c
+@@ -1107,6 +1107,15 @@
+                       __func__, tag);
+         return;
+     }
++
++    /*
++     * Accepting a new command clears the previous command's error.  NCQ
++     * bypasses ide_bus_exec_cmd(), so do this before its acceptance D2H FIS
++     * too. Otherwise an aborted non-NCQ command (e.g. SMART) makes the next
++     * valid NCQ command raise TFES with the stale task-file error.
++     */
++    ad->port.ifs[0].error = 0;
++    ad->port.ifs[0].status = READY_STAT | SEEK_STAT;
+ 
+     /*
+      * A NCQ command clears the bit in PxCI after the command has been QUEUED
