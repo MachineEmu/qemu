@@ -1,0 +1,20 @@
+[package]
+name = "board-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+net-offload = { path = "../net-offload" }
+board-core = { path = "../board-core" }
+mt7981-machine = { path = "../mt7981-machine" }
+udmpro-machine = { path = "../udmpro-machine" }
+bcm5616x-machine = { path = "../bcm5616x-machine" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true

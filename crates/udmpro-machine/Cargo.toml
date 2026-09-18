@@ -1,0 +1,22 @@
+[package]
+name = "udmpro-machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure Rust UDM Pro board register model for QEMU FFI integration"
+
+[dependencies]
+net-offload = { path = "../net-offload" }
+board-core = { path = "../board-core" }
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

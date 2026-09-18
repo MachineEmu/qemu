@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/net-offload",
+  "crates/board-core",
+  "crates/bcm5616x-machine",
+  "crates/mt7981-machine",
+  "crates/udmpro-machine",
+  "crates/board-ffi",
+  "crates/board-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+anyhow = "1"
+bytes = "1"
+flate2 = "1"
+hex = "0.4"
+rsa = "0.9"
+sha1 = "0.10"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+zbus = { version = "5.19", default-features = false, features = ["p2p", "tokio"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

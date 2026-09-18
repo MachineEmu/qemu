@@ -1,0 +1,30 @@
+[package]
+name = "mt7981-machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure Rust MT7981 board and MMIO model for QEMU FFI integration"
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+net-offload = { path = "../net-offload" }
+board-core = { path = "../board-core" }
+flate2.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+# Rust 2024 classifies `no_mangle` as an unsafe attribute because exported
+# names participate in the linker's global symbol namespace. The FFI surface
+# below contains no unsafe operations or raw pointers; permit only this lint
+# at the package boundary while keeping the implementation safe.
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

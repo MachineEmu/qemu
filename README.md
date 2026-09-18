@@ -6,6 +6,11 @@ custom machines, QEMU-side helpers, and engine-build provenance.
 MachineEmu-owned code is currently licensed under AGPL-3.0-or-later. Imported
 QEMU and third-party components retain their upstream licenses and notices.
 
+The first Rust migration slice contains `board-core`, `net-offload`, the three
+board model crates, `board-ffi`, and `board-tools`. Display, audio, remote
+device, and analysis crates remain in the source repository until their own
+milestones.
+
 ## Independent checkout
 
 An engine build must be reproducible from this checkout and its declared inputs.

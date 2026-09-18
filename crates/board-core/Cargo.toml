@@ -1,0 +1,10 @@
+[package]
+name = "board-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+net-offload = { path = "../net-offload" }
+thiserror.workspace = true

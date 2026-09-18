@@ -1,0 +1,20 @@
+[package]
+name = "board-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "board-tools"
+path = "src/main.rs"
+
+[dependencies]
+board-core = { path = "../board-core" }
+mt7981-machine = { path = "../mt7981-machine" }
+udmpro-machine = { path = "../udmpro-machine" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+hex.workspace = true
