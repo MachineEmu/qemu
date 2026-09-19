@@ -8,6 +8,8 @@ members = [
   "crates/udmpro-machine",
   "crates/board-ffi",
   "crates/board-tools",
+  "crates/remote-device-protocol",
+  "crates/remote-device-bridge",
 ]
 
 [workspace.package]
