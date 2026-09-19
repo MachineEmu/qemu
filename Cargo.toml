@@ -11,6 +11,7 @@ members = [
   "crates/remote-device-protocol",
   "crates/remote-device-bridge",
   "crates/spice-audio",
+  "crates/display-stream",
 ]
 
 [workspace.package]

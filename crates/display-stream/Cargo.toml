@@ -1,0 +1,32 @@
+[package]
+name = "display-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Framing and bounded fan-out primitives for QEMU H.264 display streaming"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+gstreamer = { version = "0.25", features = ["v1_24"] }
+gstreamer-allocators = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = { version = "0.25", features = ["v1_24"] }
+memmap2 = "0.9"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "time", "signal"] }
+zbus.workspace = true
+
+[[bin]]
+name = "display-stream-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "display-stream"
+path = "src/bin/stream.rs"
