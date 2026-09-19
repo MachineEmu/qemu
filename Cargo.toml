@@ -10,6 +10,7 @@ members = [
   "crates/board-tools",
   "crates/remote-device-protocol",
   "crates/remote-device-bridge",
+  "crates/spice-audio",
 ]
 
 [workspace.package]
