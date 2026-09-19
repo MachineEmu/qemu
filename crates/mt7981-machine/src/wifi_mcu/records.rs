@@ -483,13 +483,24 @@ mod tests {
 
     #[test]
     fn captured_original_driver_requests_get_exact_reply_lengths_and_ids() {
+        // Small, self-contained selection from the original U6+ startup capture.
+        // Keeping the requests here makes this crate independently testable after
+        // being moved out of the source-tree fixture layout.
+        const STARTUP_REQUESTS: &[(&str, &str)] = &[
+            ("2a", "000001000100000000000c000100020000798103"),
+            (
+                "07",
+                "0502000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                "25",
+                "001f0100010e0200000014002000010000000000ffffffffffff0100",
+            ),
+            ("27", "00000000"),
+        ];
+
         let mut state = StartupConfig::default();
-        let fixture = include_str!("../../../../fixtures/mt7981-startup-records.txt");
-        for line in fixture
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.is_empty())
-        {
-            let (cid, hex) = line.split_once(' ').unwrap();
+        for &(cid, hex) in STARTUP_REQUESTS {
             let cid = u8::from_str_radix(cid, 16).unwrap();
             let p: Vec<_> = (0..hex.len())
                 .step_by(2)
