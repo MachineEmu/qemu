@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Thu, 17 Sep 2026 14:35:00 +0200
+Subject: [PATCH] hw/i386: expose analysis PIT ACPI timer identity
+
+VMAware 2.8.2's CLOCK technique flags Windows guests when present devices do
+not include the legacy x86 PIT/AT timer hardware ID ACPI\PNP0100/PNP0100.
+
+QEMU already creates the i8254/PIT for PC machines, but q35 does not expose a
+matching ACPI device node.  Add a small analysis-profile-only PNP0100 node so
+Windows enumerates the timer identity without changing ordinary q35 launches.
+---
+ hw/i386/acpi-build.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 7e6df1315f..0bbf4e76de 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -432,6 +432,31 @@ static void build_hpet_aml(Aml *table, bool analysis_profile)
+     aml_append(table, scope);
+ }
+ 
++static void build_analysis_pit_aml(Aml *table)
++{
++    Aml *crs;
++    Aml *method;
++    Aml *scope = aml_scope("_SB");
++    Aml *dev = aml_device("TIMR");
++
++    aml_append(dev, aml_name_decl("_HID", aml_eisaid("PNP0100")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(0)));
++    aml_append(dev, aml_name_decl("_DDN",
++                                  aml_unicode("System timer")));
++
++    method = aml_method("_STA", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(0x0F)));
++    aml_append(dev, method);
++
++    crs = aml_resource_template();
++    aml_append(crs, aml_io(AML_DECODE16, 0x40, 0x40, 0x01, 0x04));
++    aml_append(crs, aml_irq_no_flags(0));
++    aml_append(dev, aml_name_decl("_CRS", crs));
++
++    aml_append(scope, dev);
++    aml_append(table, scope);
++}
++
+ static Aml *build_vmbus_device_aml(VMBusBridge *vmbus_bridge)
+ {
+     Aml *dev;
+@@ -1033,6 +1058,13 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+         build_hpet_aml(dsdt, pcms->analysis_profile);
+     }
+ 
++    if (pcms->analysis_profile) {
++        /*
++         * Mirror the legacy PIT identity present on physical x86 PCs.
++         */
++        build_analysis_pit_aml(dsdt);
++    }
++
+     if (vmbus_bridge) {
+         sb_scope = aml_scope("_SB");
+         aml_append(sb_scope, build_vmbus_device_aml(vmbus_bridge));
+-- 
+2.51.0

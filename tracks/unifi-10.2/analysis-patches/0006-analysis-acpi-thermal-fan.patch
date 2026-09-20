@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Wed, 16 Sep 2026 23:25:00 +0200
+Subject: [PATCH] hw/i386: add opt-in analysis ACPI thermal and fan devices
+
+Expose a small static ACPI thermal/fan surface when the analysis profile is
+enabled.  The values are profile-owned machine properties and are only emitted
+for the opt-in analysis machine path, leaving ordinary q35 launches unchanged.
+---
+ hw/acpi/aml-build.c         | 12 +++++++
+ hw/i386/acpi-build.c        | 67 +++++++++++++++++++++++++++++++++++++
+ hw/i386/pc.c                | 65 +++++++++++++++++++++++++++++++++++
+ include/hw/acpi/aml-build.h |  1 +
+ include/hw/i386/pc.h        |  8 +++++
+ 5 files changed, 153 insertions(+)
+
+diff --git a/hw/acpi/aml-build.c b/hw/acpi/aml-build.c
+index 12e21ccde9..9bb5506c2d 100644
+--- a/hw/acpi/aml-build.c
++++ b/hw/acpi/aml-build.c
+@@ -1162,6 +1162,18 @@ Aml *aml_device(const char *name_format, ...)
+     return var;
+ }
+ 
++/* ACPI 1.0b: 16.2.5.2 Named Objects Encoding: DefThermalZone */
++Aml *aml_thermal_zone(const char *name_format, ...)
++{
++    va_list ap;
++    Aml *var = aml_bundle(0x85 /* ThermalZoneOp */, AML_EXT_PACKAGE);
++
++    va_start(ap, name_format);
++    build_append_namestringv(var->buf, name_format, ap);
++    va_end(ap);
++    return var;
++}
++
+ /* ACPI 1.0b: 6.4.1 ASL Macros for Resource Descriptors */
+ Aml *aml_resource_template(void)
+ {
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 2a94b25161..3bfdaf37f0 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -845,6 +845,78 @@ static void build_acpi0017(Aml *table)
+     aml_append(table, scope);
+ }
+ 
++static uint64_t analysis_temp_to_acpi(int64_t celsius)
++{
++    return (uint64_t)(celsius * 10 + 2732);
++}
++
++static void build_analysis_sensor_aml(Aml *table, PCMachineState *pcms)
++{
++    Aml *scope;
++    Aml *dev;
++    Aml *tz;
++    Aml *method;
++    Aml *pkg;
++    uint64_t temp = analysis_temp_to_acpi(pcms->analysis_temp_c);
++    uint64_t passive = analysis_temp_to_acpi(pcms->analysis_passive_temp_c);
++    uint64_t critical = analysis_temp_to_acpi(pcms->analysis_critical_temp_c);
++
++    scope = aml_scope("\\_SB");
++    dev = aml_device("FAN0");
++    aml_append(dev, aml_name_decl("_HID", aml_eisaid("PNP0C0B")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(0)));
++    aml_append(dev, aml_name_decl("_STR", aml_unicode("System Fan")));
++
++    method = aml_method("_STA", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(0x0f)));
++    aml_append(dev, method);
++
++    method = aml_method("_FIF", 0, AML_NOTSERIALIZED);
++    pkg = aml_package(4);
++    aml_append(pkg, aml_int(0)); /* revision */
++    aml_append(pkg, aml_int(0)); /* fine grained control not supported */
++    aml_append(pkg, aml_int(0)); /* lowest fan speed not controlled */
++    aml_append(pkg, aml_int(0)); /* step size not controlled */
++    aml_append(method, aml_return(pkg));
++    aml_append(dev, method);
++
++    method = aml_method("_FST", 0, AML_NOTSERIALIZED);
++    pkg = aml_package(3);
++    aml_append(pkg, aml_int(0)); /* revision */
++    aml_append(pkg, aml_int(pcms->analysis_fan_rpm ? 1 : 0));
++    aml_append(pkg, aml_int(pcms->analysis_fan_rpm));
++    aml_append(method, aml_return(pkg));
++    aml_append(dev, method);
++
++    method = aml_method("FRPM", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(pcms->analysis_fan_rpm)));
++    aml_append(dev, method);
++
++    aml_append(scope, dev);
++    aml_append(table, scope);
++
++    scope = aml_scope("\\_TZ");
++    tz = aml_thermal_zone("TZ00");
++    method = aml_method("_TMP", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(temp)));
++    aml_append(tz, method);
++    method = aml_method("_PSV", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(passive)));
++    aml_append(tz, method);
++    method = aml_method("_CRT", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(critical)));
++    aml_append(tz, method);
++    method = aml_method("_AC0", 0, AML_NOTSERIALIZED);
++    aml_append(method, aml_return(aml_int(passive)));
++    aml_append(tz, method);
++    pkg = aml_package(1);
++    aml_append(pkg, aml_name("\\_SB.FAN0"));
++    aml_append(tz, aml_name_decl("_AL0", pkg));
++    aml_append(tz, aml_name_decl("_TZP", aml_int(100)));
++    aml_append(scope, tz);
++    aml_append(table, scope);
++}
++
+ static void
+ build_dsdt(GArray *table_data, BIOSLinker *linker,
+            AcpiPmInfo *pm, AcpiMiscInfo *misc,
+@@ -1249,6 +1315,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+ 
+         aml_append(sb_scope, dev);
+     }
++    if (pcms->analysis_profile) { build_analysis_sensor_aml(dsdt, pcms); }
+     aml_append(dsdt, sb_scope);
+ 
+     if (pm->pcihp_bridge_en || pm->pcihp_root_en) {
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index d570327617..d1c91f4a1a 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1532,6 +1532,61 @@ static void pc_machine_set_analysis_profile_json_base64(Object *obj,
+     analysis_profile_free_string(validated);
+ }
+ 
++static void pc_machine_get_analysis_temp(Object *obj, Visitor *v,
++                                         const char *name, void *opaque,
++                                         Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++    int64_t value = pcms->analysis_temp_c;
++
++    visit_type_int(v, name, &value, errp);
++}
++
++static void pc_machine_set_analysis_temp(Object *obj, Visitor *v,
++                                         const char *name, void *opaque,
++                                         Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++    int64_t value;
++
++    if (!visit_type_int(v, name, &value, errp)) {
++        return;
++    }
++    if (value < -20 || value > 127) {
++        error_setg(errp, "%s must be in the range -20..127 Celsius", name);
++        return;
++    }
++    if (!strcmp(name, "x-analysis-temp-c")) {
++        pcms->analysis_temp_c = value;
++    } else if (!strcmp(name, "x-analysis-passive-temp-c")) {
++        pcms->analysis_passive_temp_c = value;
++    } else {
++        pcms->analysis_critical_temp_c = value;
++    }
++}
++
++static void pc_machine_get_analysis_fan_rpm(Object *obj, Visitor *v,
++                                            const char *name, void *opaque,
++                                            Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++    uint32_t value = pcms->analysis_fan_rpm;
++
++    visit_type_uint32(v, name, &value, errp);
++}
++
++static void pc_machine_set_analysis_fan_rpm(Object *obj, Visitor *v,
++                                            const char *name, void *opaque,
++                                            Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++
++    visit_type_uint32(v, name, &pcms->analysis_fan_rpm, errp);
++    if (pcms->analysis_fan_rpm > 20000) {
++        error_setg(errp, "%s must be in the range 0..20000 RPM", name);
++    }
++}
++
+ static bool pc_machine_get_fd_bootchk(Object *obj, Error **errp)
+ {
+     PCMachineState *pcms = PC_MACHINE(obj);
+@@ -1753,6 +1805,10 @@ static void pc_machine_initfn(Object *obj)
+     pcms->fd_bootchk = true;
+     pcms->default_bus_bypass_iommu = false;
+ 
++    pcms->analysis_temp_c = 42;
++    pcms->analysis_passive_temp_c = 75;
++    pcms->analysis_critical_temp_c = 95;
++    pcms->analysis_fan_rpm = 1200;
+     pc_system_flash_create(pcms);
+     pcms->pcspk = isa_new(TYPE_PC_SPEAKER);
+     object_property_add_alias(OBJECT(pcms), "pcspk-audiodev",
+@@ -1874,6 +1930,15 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, "x-analysis-profile-json-base64",
+         "Validate base64-encoded resolved analysis profile JSON through the Rust profile ABI");
+ 
++    object_class_property_add(oc, "x-analysis-temp-c", "int",
++        pc_machine_get_analysis_temp, pc_machine_set_analysis_temp, NULL, NULL);
++    object_class_property_add(oc, "x-analysis-passive-temp-c", "int",
++        pc_machine_get_analysis_temp, pc_machine_set_analysis_temp, NULL, NULL);
++    object_class_property_add(oc, "x-analysis-critical-temp-c", "int",
++        pc_machine_get_analysis_temp, pc_machine_set_analysis_temp, NULL, NULL);
++    object_class_property_add(oc, "x-analysis-fan-rpm", "uint32",
++        pc_machine_get_analysis_fan_rpm, pc_machine_set_analysis_fan_rpm, NULL, NULL);
++
+     object_class_property_add_bool(oc, "fd-bootchk",
+         pc_machine_get_fd_bootchk,
+         pc_machine_set_fd_bootchk);
+diff --git a/include/hw/acpi/aml-build.h b/include/hw/acpi/aml-build.h
+index 928d2a1012..1d1b024752 100644
+--- a/include/hw/acpi/aml-build.h
++++ b/include/hw/acpi/aml-build.h
+@@ -389,6 +389,7 @@ Aml *aml_error_device(void);
+ /* Block AML object primitives */
+ Aml *aml_scope(const char *name_format, ...) G_GNUC_PRINTF(1, 2);
+ Aml *aml_device(const char *name_format, ...) G_GNUC_PRINTF(1, 2);
++Aml *aml_thermal_zone(const char *name_format, ...) G_GNUC_PRINTF(1, 2);
+ Aml *aml_method(const char *name, int arg_count, AmlSerializeFlag sflag);
+ Aml *aml_if(Aml *predicate);
+ Aml *aml_else(void);
+diff --git a/include/hw/i386/pc.h b/include/hw/i386/pc.h
+index 85d75983b3..d5507a02d5 100644
+--- a/include/hw/i386/pc.h
++++ b/include/hw/i386/pc.h
+@@ -51,6 +51,10 @@ typedef struct PCMachineState {
+     bool i8042_enabled;
+     bool default_bus_bypass_iommu;
+     bool analysis_profile;
++    int64_t analysis_temp_c;
++    int64_t analysis_passive_temp_c;
++    int64_t analysis_critical_temp_c;
++    uint32_t analysis_fan_rpm;
+     bool fd_bootchk;
+     uint64_t max_fw_size;
+ 
+-- 
+2.45.2

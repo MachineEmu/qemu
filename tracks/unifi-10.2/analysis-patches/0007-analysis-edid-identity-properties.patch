@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Wed, 16 Sep 2026 23:45:00 +0200
+Subject: [PATCH] hw/display: expose EDID identity fields as device properties
+
+QEMU's EDID generator already carries vendor, monitor name, serial, and
+physical-size fields, but the standard EDID property macro only exposes
+resolution and refresh rate.  Expose the remaining fields as ordinary qdev
+properties so the opt-in analysis profile can provide a coherent monitor
+identity without changing default EDID data for ordinary launches.
+
+Keep the default strings local to EDID generation rather than writing string
+literals into qdev-owned property fields.
+---
+ hw/display/edid-generate.c  | 23 +++++++++++++----------
+ include/hw/display/edid.h   | 10 ++++++++--
+ 2 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/hw/display/edid-generate.c b/hw/display/edid-generate.c
+index 2cb819675e..e4fc883db8 100644
+--- a/hw/display/edid-generate.c
++++ b/hw/display/edid-generate.c
+@@ -390,14 +390,17 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
+     uint32_t refresh_rate = info->refresh_rate ? info->refresh_rate : 75000;
+     uint32_t dpi = 100; /* if no width_mm/height_mm */
+     uint32_t large_screen = 0;
++    const char *vendor = info->vendor;
++    const char *name = info->name;
++    const char *serial = info->serial;
+ 
+     /* =============== set defaults  =============== */
+ 
+-    if (!info->vendor || strlen(info->vendor) != 3) {
+-        info->vendor = "RHT";
++    if (!vendor || strlen(vendor) != 3) {
++        vendor = "RHT";
+     }
+-    if (!info->name) {
+-        info->name = "QEMU Monitor";
++    if (!name) {
++        name = "QEMU Monitor";
+     }
+     if (!info->prefx) {
+         info->prefx = 1280;
+@@ -446,11 +449,11 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
+     edid[7] = 0x00;
+ 
+     /* manufacturer id, product code, serial number */
+-    uint16_t vendor_id = ((((info->vendor[0] - '@') & 0x1f) << 10) |
+-                          (((info->vendor[1] - '@') & 0x1f) <<  5) |
+-                          (((info->vendor[2] - '@') & 0x1f) <<  0));
++    uint16_t vendor_id = ((((vendor[0] - '@') & 0x1f) << 10) |
++                          (((vendor[1] - '@') & 0x1f) <<  5) |
++                          (((vendor[2] - '@') & 0x1f) <<  0));
+     uint16_t model_nr = 0x1234;
+-    uint32_t serial_nr = info->serial ? atoi(info->serial) : 0;
++    uint32_t serial_nr = serial ? atoi(serial) : 0;
+     stw_be_p(edid +  8, vendor_id);
+     stw_le_p(edid + 10, model_nr);
+     stl_le_p(edid + 12, serial_nr);
+@@ -516,13 +519,13 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
+     edid_desc_ranges(desc);
+     desc = edid_desc_next(edid, dta, desc);
+ 
+-    if (desc && info->name) {
+-        edid_desc_text(desc, 0xfc, info->name);
++    if (desc && name) {
++        edid_desc_text(desc, 0xfc, name);
+         desc = edid_desc_next(edid, dta, desc);
+     }
+ 
+-    if (desc && info->serial) {
+-        edid_desc_text(desc, 0xff, info->serial);
++    if (desc && serial) {
++        edid_desc_text(desc, 0xff, serial);
+         desc = edid_desc_next(edid, dta, desc);
+     }
+ 
+diff --git a/include/hw/display/edid.h b/include/hw/display/edid.h
+index 91c0a428af..270a51b3fc 100644
+--- a/include/hw/display/edid.h
++++ b/include/hw/display/edid.h
+@@ -4,9 +4,9 @@
+ #define EDID_NAME_MAX_LENGTH 12
+ 
+ typedef struct qemu_edid_info {
+-    const char *vendor; /* http://www.uefi.org/pnp_id_list */
+-    const char *name;
+-    const char *serial;
++    char *vendor; /* http://www.uefi.org/pnp_id_list */
++    char *name;
++    char *serial;
+     uint16_t    width_mm;
+     uint16_t    height_mm;
+     uint32_t    prefx;
+@@ -25,6 +25,11 @@ void qemu_edid_region_io(MemoryRegion *region, Object *owner,
+ uint32_t qemu_edid_dpi_to_mm(uint32_t dpi, uint32_t res);
+ 
+ #define DEFINE_EDID_PROPERTIES(_state, _edid_info)                         \
++    DEFINE_PROP_STRING("vendor", _state, _edid_info.vendor),               \
++    DEFINE_PROP_STRING("name", _state, _edid_info.name),                   \
++    DEFINE_PROP_STRING("serial", _state, _edid_info.serial),               \
++    DEFINE_PROP_UINT16("width-mm", _state, _edid_info.width_mm, 0),        \
++    DEFINE_PROP_UINT16("height-mm", _state, _edid_info.height_mm, 0),      \
+     DEFINE_PROP_UINT32("xres", _state, _edid_info.prefx, 0),               \
+     DEFINE_PROP_UINT32("yres", _state, _edid_info.prefy, 0),               \
+     DEFINE_PROP_UINT32("xmax", _state, _edid_info.maxx, 0),                \
+-- 
+2.45.2

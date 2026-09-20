@@ -1,0 +1,146 @@
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 35f462ba10..ba9ce2cb69 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -66,6 +66,7 @@
+ #include "trace.h"
+ #include "sev.h"
+ #include "analysis_profile.h"
++#include "hw/pci/pci.h"
+ #include CONFIG_DEVICES
+ 
+ #ifdef CONFIG_XEN_EMU
+@@ -1497,6 +1498,17 @@ static bool pc_machine_get_analysis_profile(Object *obj, Error **errp)
+     return pcms->analysis_profile;
+ }
+ 
++static void pc_machine_apply_analysis_pci_defaults(PCMachineState *pcms)
++{
++    if (pcms->analysis_profile) {
++        pci_set_default_subsystem_ids(pcms->analysis_pci_subsystem_vendor_id,
++                                      pcms->analysis_pci_subsystem_id);
++    } else {
++        pci_set_default_subsystem_ids(PCI_SUBVENDOR_ID_REDHAT_QUMRANET,
++                                      PCI_SUBDEVICE_ID_QEMU);
++    }
++}
++
+ static void pc_machine_set_analysis_profile(Object *obj, bool value,
+                                             Error **errp)
+ {
+@@ -1509,6 +1521,7 @@ static void pc_machine_set_analysis_profile(Object *obj, bool value,
+          * enables it, because it is a common virtualization probe. */
+         pcms->vmport = ON_OFF_AUTO_OFF;
+     }
++    pc_machine_apply_analysis_pci_defaults(pcms);
+ }
+ 
+ static char *pc_machine_get_analysis_profile_json_base64(Object *obj, Error **errp)
+@@ -1600,6 +1613,40 @@ static void pc_machine_set_analysis_fan_rpm(Object *obj, Visitor *v,
+     }
+ }
+ 
++static void pc_machine_get_analysis_pci_id(Object *obj, Visitor *v,
++                                           const char *name, void *opaque,
++                                           Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++    uint32_t value = !strcmp(name, "x-analysis-pci-subsystem-vendor-id")
++        ? pcms->analysis_pci_subsystem_vendor_id
++        : pcms->analysis_pci_subsystem_id;
++
++    visit_type_uint32(v, name, &value, errp);
++}
++
++static void pc_machine_set_analysis_pci_id(Object *obj, Visitor *v,
++                                           const char *name, void *opaque,
++                                           Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++    uint32_t value;
++
++    if (!visit_type_uint32(v, name, &value, errp)) {
++        return;
++    }
++    if (value == 0 || value > UINT16_MAX) {
++        error_setg(errp, "%s must be a non-zero uint16", name);
++        return;
++    }
++    if (!strcmp(name, "x-analysis-pci-subsystem-vendor-id")) {
++        pcms->analysis_pci_subsystem_vendor_id = value;
++    } else {
++        pcms->analysis_pci_subsystem_id = value;
++    }
++    pc_machine_apply_analysis_pci_defaults(pcms);
++}
++
+ static bool pc_machine_get_fd_bootchk(Object *obj, Error **errp)
+ {
+     PCMachineState *pcms = PC_MACHINE(obj);
+@@ -1809,6 +1856,8 @@ static void pc_machine_initfn(Object *obj)
+     pcms->analysis_passive_temp_c = 75;
+     pcms->analysis_critical_temp_c = 95;
+     pcms->analysis_fan_rpm = 1200;
++    pcms->analysis_pci_subsystem_vendor_id = 0x1028;
++    pcms->analysis_pci_subsystem_id = 0x0a56;
+     pc_system_flash_create(pcms);
+     pcms->pcspk = isa_new(TYPE_PC_SPEAKER);
+     object_property_add_alias(OBJECT(pcms), "pcspk-audiodev",
+@@ -1953,6 +2002,15 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_add(oc, "x-analysis-fan-rpm", "uint32",
+         pc_machine_get_analysis_fan_rpm, pc_machine_set_analysis_fan_rpm, NULL, NULL);
+ 
++    object_class_property_add(oc, "x-analysis-pci-subsystem-vendor-id", "uint32",
++        pc_machine_get_analysis_pci_id, pc_machine_set_analysis_pci_id, NULL, NULL);
++    object_class_property_set_description(oc, "x-analysis-pci-subsystem-vendor-id",
++        "PCI subsystem vendor ID used as the analysis-profile default");
++    object_class_property_add(oc, "x-analysis-pci-subsystem-id", "uint32",
++        pc_machine_get_analysis_pci_id, pc_machine_set_analysis_pci_id, NULL, NULL);
++    object_class_property_set_description(oc, "x-analysis-pci-subsystem-id",
++        "PCI subsystem device ID used as the analysis-profile default");
++
+     object_class_property_add_bool(oc, "fd-bootchk",
+         pc_machine_get_fd_bootchk,
+         pc_machine_set_fd_bootchk);
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index b1eba348e0..d34c189b8b 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -339,6 +339,12 @@ static uint16_t pci_default_sub_device_id = PCI_SUBDEVICE_ID_QEMU;
+ 
+ PCIHostStateList pci_host_bridges;
+ 
++void pci_set_default_subsystem_ids(uint16_t vendor_id, uint16_t device_id)
++{
++    pci_default_sub_vendor_id = vendor_id;
++    pci_default_sub_device_id = device_id;
++}
++
+ int pci_bar(PCIDevice *d, int reg)
+ {
+     uint8_t type;
+diff --git a/include/hw/i386/pc.h b/include/hw/i386/pc.h
+index ba8ea703ef..789b7c7899 100644
+--- a/include/hw/i386/pc.h
++++ b/include/hw/i386/pc.h
+@@ -55,6 +55,8 @@ typedef struct PCMachineState {
+     int64_t analysis_passive_temp_c;
+     int64_t analysis_critical_temp_c;
+     uint32_t analysis_fan_rpm;
++    uint16_t analysis_pci_subsystem_vendor_id;
++    uint16_t analysis_pci_subsystem_id;
+     bool fd_bootchk;
+     uint64_t max_fw_size;
+ 
+diff --git a/include/hw/pci/pci.h b/include/hw/pci/pci.h
+index b72e484500..9be4e384b4 100644
+--- a/include/hw/pci/pci.h
++++ b/include/hw/pci/pci.h
+@@ -9,6 +9,7 @@
+ #include "hw/isa/isa.h"
+ 
+ extern bool pci_available;
++void pci_set_default_subsystem_ids(uint16_t vendor_id, uint16_t device_id);
+ 
+ /* PCI bus */
+ 

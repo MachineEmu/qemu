@@ -1,0 +1,69 @@
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index ea13dc53d7..8abf5f0e52 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -1285,7 +1285,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+     /* create fw_cfg node, unconditionally */
+     {
+         scope = aml_scope("\\_SB.PCI0");
+-        fw_cfg_add_acpi_dsdt(scope, x86ms->fw_cfg);
++        fw_cfg_add_acpi_dsdt(scope, x86ms->fw_cfg, pcms->analysis_profile);
+         aml_append(dsdt, scope);
+     }
+ 
+diff --git a/hw/i386/acpi-microvm.c b/hw/i386/acpi-microvm.c
+index a180d2d791..89a9fb4854 100644
+--- a/hw/i386/acpi-microvm.c
++++ b/hw/i386/acpi-microvm.c
+@@ -118,7 +118,7 @@ static void acpi_build_microvm(AcpiBuildTables *tables,
+     dsdt = init_aml_allocator();
+ 
+     sb_scope = aml_scope("_SB");
+-    fw_cfg_add_acpi_dsdt(sb_scope, x86ms->fw_cfg);
++    fw_cfg_add_acpi_dsdt(sb_scope, x86ms->fw_cfg, false);
+     qbus_build_aml(BUS(isabus), sb_scope);
+     build_ged_aml(sb_scope, GED_DEVICE, x86ms->acpi_dev,
+                   GED_MMIO_IRQ, AML_SYSTEM_MEMORY, GED_MMIO_BASE);
+
+diff --git a/hw/i386/fw_cfg.c b/hw/i386/fw_cfg.c
+index c0e201f94d..4584d78a26 100644
+--- a/hw/i386/fw_cfg.c
++++ b/hw/i386/fw_cfg.c
+@@ -213,7 +213,8 @@ void fw_cfg_build_feature_control(MachineState *ms, FWCfgState *fw_cfg)
+ }
+ 
+ #ifdef CONFIG_ACPI
+-void fw_cfg_add_acpi_dsdt(Aml *scope, FWCfgState *fw_cfg)
++void fw_cfg_add_acpi_dsdt(Aml *scope, FWCfgState *fw_cfg,
++                          bool analysis_profile)
+ {
+     /*
+      * when using port i/o, the 8-bit data register *always* overlaps
+@@ -225,10 +226,12 @@ void fw_cfg_add_acpi_dsdt(Aml *scope, FWCfgState *fw_cfg)
+     uint8_t io_size = object_property_get_bool(obj, "dma_enabled", NULL) ?
+         ROUND_UP(FW_CFG_CTL_SIZE, 4) + sizeof(dma_addr_t) :
+         FW_CFG_CTL_SIZE;
+-    Aml *dev = aml_device("FWCF");
++    Aml *dev = aml_device(analysis_profile ? "FDCF" : "FWCF");
+     Aml *crs = aml_resource_template();
+ 
+-    aml_append(dev, aml_name_decl("_HID", aml_string("QEMU0002")));
++    aml_append(dev, aml_name_decl("_HID",
++                                  aml_string(analysis_profile ? "PNP0C02" :
++                                             "QEMU0002")));
+ 
+     /* device present, functioning, decoding, not shown in UI */
+     aml_append(dev, aml_name_decl("_STA", aml_int(0xB)));
+diff --git a/hw/i386/fw_cfg.h b/hw/i386/fw_cfg.h
+index e5d4ecb66c..4ae183ab13 100644
+--- a/hw/i386/fw_cfg.h
++++ b/hw/i386/fw_cfg.h
+@@ -26,7 +26,7 @@ FWCfgState *fw_cfg_arch_create(MachineState *ms,
+ void fw_cfg_build_smbios(PCMachineState *pcms, FWCfgState *fw_cfg,
+                          SmbiosEntryPointType ep_type);
+ void fw_cfg_build_feature_control(MachineState *ms, FWCfgState *fw_cfg);
+-void fw_cfg_add_acpi_dsdt(Aml *scope, FWCfgState *fw_cfg);
++void fw_cfg_add_acpi_dsdt(Aml *scope, FWCfgState *fw_cfg, bool analysis_profile);
+ void fw_cfg_add_e820(FWCfgState *fw_cfg);
+ 
+ #endif

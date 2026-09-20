@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Wed, 16 Sep 2026 22:45:00 +0200
+Subject: [PATCH] hw/i386: validate analysis profile JSON through Rust ABI
+
+Link the dedicated analysis QEMU build against the repository's
+analysis-profile static library and expose an opt-in x86 PC machine property
+that validates base64-encoded resolved profile JSON through the Rust C ABI.
+
+This keeps policy validation in Rust while the C side remains a small QEMU
+option parse hook. Ordinary PC and Q35 machines keep their defaults and the
+common QEMU build does not receive this option.
+---
+ hw/i386/pc.c     | 35 +++++++++++++++++++++++++++++++++++
+ meson.build      |  3 +++
+ meson_options.txt |  3 +++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index ddea077a97..d570327617 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -65,6 +65,7 @@
+ #include "e820_memory_layout.h"
+ #include "trace.h"
+ #include "sev.h"
++#include "analysis_profile.h"
+ #include CONFIG_DEVICES
+ 
+ #ifdef CONFIG_XEN_EMU
+@@ -1510,6 +1511,40 @@ static void pc_machine_set_analysis_profile(Object *obj, bool value,
+     }
+ }
+ 
++static char *pc_machine_get_analysis_profile_json_base64(Object *obj, Error **errp)
++{
++    return g_strdup("");
++}
++
++static void pc_machine_set_analysis_profile_json_base64(Object *obj,
++                                                       const char *value,
++                                                       Error **errp)
++{
++    gsize decoded_len = 0;
++    guchar *decoded;
++    char *validated;
++
++    if (!value || !*value) {
++        error_setg(errp, "analysis profile JSON base64 must not be empty");
++        return;
++    }
++
++    decoded = g_base64_decode(value, &decoded_len);
++    if (!decoded || decoded_len == 0) {
++        g_free(decoded);
++        error_setg(errp, "analysis profile JSON base64 is empty or invalid");
++        return;
++    }
++
++    validated = analysis_profile_validate_json(decoded, decoded_len);
++    g_free(decoded);
++    if (!validated) {
++        error_setg(errp, "analysis profile JSON rejected by Rust validator");
++        return;
++    }
++    analysis_profile_free_string(validated);
++}
++
+ static bool pc_machine_get_fd_bootchk(Object *obj, Error **errp)
+ {
+     PCMachineState *pcms = PC_MACHINE(obj);
+@@ -1844,6 +1866,12 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, PC_MACHINE_ANALYSIS_PROFILE,
+         "Enable opt-in malware-analysis PC compatibility settings");
+ 
++    object_class_property_add_str(oc, "x-analysis-profile-json-base64",
++        pc_machine_get_analysis_profile_json_base64,
++        pc_machine_set_analysis_profile_json_base64);
++    object_class_property_set_description(oc, "x-analysis-profile-json-base64",
++        "Validate base64-encoded resolved analysis profile JSON through the Rust profile ABI");
++
+     object_class_property_add_bool(oc, "fd-bootchk",
+         pc_machine_get_fd_bootchk,
+         pc_machine_set_fd_bootchk);
+diff --git a/meson.build b/meson.build
+index 1f405ae28f..4d40eab9b6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -842,6 +842,9 @@ emulator_link_args = []
+ if get_option('unifi_board_lib') != ''
+   emulator_link_args += get_option('unifi_board_lib')
+ endif
++if get_option('analysis_profile_lib') != ''
++  emulator_link_args += get_option('analysis_profile_lib')
++endif
+ midl = not_found
+ widl = not_found
+ pathcch = not_found
+diff --git a/meson_options.txt b/meson_options.txt
+index 7b02f83d49..d3fba7d065 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -393,3 +393,6 @@ option('strict_rust_lints', type: 'boolean', value: false,
+ 
+ option('unifi_board_lib', type : 'string', value : '',
+        description: 'static library containing repository UniFi board models')
++
++option('analysis_profile_lib', type : 'string', value : '',
++       description: 'static library containing repository analysis profile validation')
+-- 
+2.45.2

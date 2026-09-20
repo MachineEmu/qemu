@@ -1,0 +1,44 @@
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index da841931e5..9c53c658eb 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -742,6 +742,7 @@ static void build_q35_pci0_int(Aml *table, bool analysis_profile)
+     Aml *method;
+     Aml *sb_scope = aml_scope("_SB");
+     Aml *pci0_scope = aml_scope("PCI0");
++    const char *gsi_prefix = analysis_profile ? "IRQ" : "GSI";
+ 
+     /* Zero => PIC mode, One => APIC Mode */
+     aml_append(table, aml_name_decl("PICF", aml_int(0)));
+@@ -754,7 +755,7 @@ static void build_q35_pci0_int(Aml *table, bool analysis_profile)
+     aml_append(pci0_scope,
+         aml_name_decl("PRTP", build_q35_routing_table("LNK", analysis_profile)));
+     aml_append(pci0_scope,
+-        aml_name_decl("PRTA", build_q35_routing_table("GSI", analysis_profile)));
++        aml_name_decl("PRTA", build_q35_routing_table(gsi_prefix, analysis_profile)));
+ 
+     method = aml_method("_PRT", 0, AML_NOTSERIALIZED);
+     {
+@@ -787,14 +788,14 @@ static void build_q35_pci0_int(Aml *table, bool analysis_profile)
+     aml_append(sb_scope, build_link_dev("LNKG", 6, aml_name("PRQG")));
+     aml_append(sb_scope, build_link_dev("LNKH", 7, aml_name("PRQH")));
+ 
+-    aml_append(sb_scope, build_gsi_link_dev("GSIA", 0x10, 0x10));
+-    aml_append(sb_scope, build_gsi_link_dev("GSIB", 0x11, 0x11));
+-    aml_append(sb_scope, build_gsi_link_dev("GSIC", 0x12, 0x12));
+-    aml_append(sb_scope, build_gsi_link_dev("GSID", 0x13, 0x13));
+-    aml_append(sb_scope, build_gsi_link_dev("GSIE", 0x14, 0x14));
+-    aml_append(sb_scope, build_gsi_link_dev("GSIF", 0x15, 0x15));
+-    aml_append(sb_scope, build_gsi_link_dev("GSIG", 0x16, 0x16));
+-    aml_append(sb_scope, build_gsi_link_dev("GSIH", 0x17, 0x17));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQA" : "GSIA", 0x10, 0x10));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQB" : "GSIB", 0x11, 0x11));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQC" : "GSIC", 0x12, 0x12));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQD" : "GSID", 0x13, 0x13));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQE" : "GSIE", 0x14, 0x14));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQF" : "GSIF", 0x15, 0x15));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQG" : "GSIG", 0x16, 0x16));
++    aml_append(sb_scope, build_gsi_link_dev(analysis_profile ? "IRQH" : "GSIH", 0x17, 0x17));
+ 
+     aml_append(table, sb_scope);
+ }

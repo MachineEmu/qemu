@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Thu, 17 Sep 2026 12:00:00 +0200
+Subject: [PATCH] hw/display: expose EDID identity fields on virtio-gpu
+
+Patch 0007 exposed the EDID generator's vendor, monitor name, serial, and
+physical-size fields through DEFINE_EDID_PROPERTIES, but virtio-gpu does not
+use that macro: it defines its own "xres"/"yres" properties with non-zero
+defaults and builds a qemu_edid_info on demand from guest-requested scanout
+state.  Appending the full macro there would collide on those two property
+names.
+
+Split the identity fields into DEFINE_EDID_IDENTITY_PROPERTIES and give
+virtio-gpu only that half, so a virtio display can carry the same
+profile-owned monitor identity as the analysis VGA device while keeping its
+own resolution properties.  Guest-requested scanout values still win for
+physical size and refresh rate; the configured values are the fallback used
+before the guest has resized anything.  Devices that do not set the new
+properties keep QEMU's default EDID.
+
+This covers monitor identity only.  virtio-gpu remains identifiable as a
+virtio device through its PCI capability structures and its guest driver;
+those are out of scope here.
+---
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 7269477a1c..cd80e920c3 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -59,12 +59,19 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
+ {
+     size_t output_idx;
+     VirtIOGPUOutputList *node;
++    struct virtio_gpu_requested_state *state = &g->req_state[scanout];
+     qemu_edid_info info = {
+-        .width_mm = g->req_state[scanout].width_mm,
+-        .height_mm = g->req_state[scanout].height_mm,
+-        .prefx = g->req_state[scanout].width,
+-        .prefy = g->req_state[scanout].height,
+-        .refresh_rate = g->req_state[scanout].refresh_rate,
++        .vendor = g->conf.edid_info.vendor,
++        .name = g->conf.edid_info.name,
++        .serial = g->conf.edid_info.serial,
++        .width_mm = state->width_mm ? state->width_mm
++                                    : g->conf.edid_info.width_mm,
++        .height_mm = state->height_mm ? state->height_mm
++                                      : g->conf.edid_info.height_mm,
++        .prefx = state->width,
++        .prefy = state->height,
++        .refresh_rate = state->refresh_rate ? state->refresh_rate
++                                            : g->conf.edid_info.refresh_rate,
+     };
+ 
+     for (output_idx = 0, node = g->conf.outputs;
+diff --git a/include/hw/display/edid.h b/include/hw/display/edid.h
+index 270a51b3fc..0bfd66d973 100644
+--- a/include/hw/display/edid.h
++++ b/include/hw/display/edid.h
+@@ -24,16 +24,21 @@ void qemu_edid_region_io(MemoryRegion *region, Object *owner,
+ 
+ uint32_t qemu_edid_dpi_to_mm(uint32_t dpi, uint32_t res);
+ 
+-#define DEFINE_EDID_PROPERTIES(_state, _edid_info)                         \
++/* Monitor identity only: for devices that define their own resolution
++ * properties and would otherwise collide on "xres"/"yres". */
++#define DEFINE_EDID_IDENTITY_PROPERTIES(_state, _edid_info)                \
+     DEFINE_PROP_STRING("vendor", _state, _edid_info.vendor),               \
+     DEFINE_PROP_STRING("name", _state, _edid_info.name),                   \
+     DEFINE_PROP_STRING("serial", _state, _edid_info.serial),               \
+     DEFINE_PROP_UINT16("width-mm", _state, _edid_info.width_mm, 0),        \
+     DEFINE_PROP_UINT16("height-mm", _state, _edid_info.height_mm, 0),      \
++    DEFINE_PROP_UINT32("refresh_rate", _state, _edid_info.refresh_rate, 0)
++
++#define DEFINE_EDID_PROPERTIES(_state, _edid_info)                         \
++    DEFINE_EDID_IDENTITY_PROPERTIES(_state, _edid_info),                   \
+     DEFINE_PROP_UINT32("xres", _state, _edid_info.prefx, 0),               \
+     DEFINE_PROP_UINT32("yres", _state, _edid_info.prefy, 0),               \
+     DEFINE_PROP_UINT32("xmax", _state, _edid_info.maxx, 0),                \
+-    DEFINE_PROP_UINT32("ymax", _state, _edid_info.maxy, 0),                \
+-    DEFINE_PROP_UINT32("refresh_rate", _state, _edid_info.refresh_rate, 0)
++    DEFINE_PROP_UINT32("ymax", _state, _edid_info.maxy, 0)
+ 
+ #endif /* EDID_H */
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 58e0f91fda..92975ec88d 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -18,6 +18,7 @@
+ #include "ui/qemu-pixman.h"
+ #include "ui/console.h"
+ #include "hw/virtio/virtio.h"
++#include "hw/display/edid.h"
+ #include "qemu/log.h"
+ #include "system/vhost-user-backend.h"
+ #include "qapi/qapi-types-virtio.h"
+@@ -130,6 +131,7 @@ struct virtio_gpu_base_conf {
+     uint32_t yres;
+     uint64_t hostmem;
+     VirtIOGPUOutputList *outputs;
++    qemu_edid_info edid_info;
+ };
+ 
+ struct virtio_gpu_ctrl_command {
+@@ -173,7 +175,8 @@ struct VirtIOGPUBaseClass {
+     DEFINE_PROP_BIT("edid", _state, _conf.flags, \
+                     VIRTIO_GPU_FLAG_EDID_ENABLED, true), \
+     DEFINE_PROP_UINT32("xres", _state, _conf.xres, 1280), \
+-    DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800)
++    DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800), \
++    DEFINE_EDID_IDENTITY_PROPERTIES(_state, _conf.edid_info)
+ 
+ typedef struct VGPUDMABuf {
+     QemuDmaBuf *buf;
+-- 
+2.45.2

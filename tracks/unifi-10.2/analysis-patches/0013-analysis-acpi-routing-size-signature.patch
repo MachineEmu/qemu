@@ -1,0 +1,64 @@
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 7e7aad8244..e79dd2ef38 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -695,13 +695,14 @@ static void append_q35_prt_entry(Aml *ctx, uint32_t nr, const char *name)
+     g_free(s);
+ }
+ 
+-static Aml *build_q35_routing_table(const char *str)
++static Aml *build_q35_routing_table(const char *str, bool analysis_profile)
+ {
+     int i;
+     Aml *pkg;
+     char *name = g_strdup_printf("%s ", str);
++    bool add_analysis_sentinel = analysis_profile && g_str_equal(str, "GSI");
+ 
+-    pkg = aml_package(128);
++    pkg = aml_package(add_analysis_sentinel ? 132 : 128);
+     for (i = 0; i < 0x18; i++) {
+             name[3] = 'E' + (i & 0x3);
+             append_q35_prt_entry(pkg, i, name);
+@@ -722,11 +723,20 @@ static Aml *build_q35_routing_table(const char *str)
+     name[3] = 'A';
+     append_q35_prt_entry(pkg, 0x1f, name);
+ 
++    if (add_analysis_sentinel) {
++        /*
++         * Break QEMU's PRTP/PRTA byte-size symmetry without affecting any
++         * real PCI function: device number 0x20 is outside the 0..31 range.
++         */
++        name[3] = 'H';
++        append_q35_prt_entry(pkg, 0x20, name);
++    }
++
+     g_free(name);
+     return pkg;
+ }
+ 
+-static void build_q35_pci0_int(Aml *table)
++static void build_q35_pci0_int(Aml *table, bool analysis_profile)
+ {
+     Aml *method;
+     Aml *sb_scope = aml_scope("_SB");
+@@ -741,9 +751,9 @@ static void build_q35_pci0_int(Aml *table)
+     aml_append(table, method);
+ 
+     aml_append(pci0_scope,
+-        aml_name_decl("PRTP", build_q35_routing_table("LNK")));
++        aml_name_decl("PRTP", build_q35_routing_table("LNK", analysis_profile)));
+     aml_append(pci0_scope,
+-        aml_name_decl("PRTA", build_q35_routing_table("GSI")));
++        aml_name_decl("PRTA", build_q35_routing_table("GSI", analysis_profile)));
+ 
+     method = aml_method("_PRT", 0, AML_NOTSERIALIZED);
+     {
+@@ -1015,7 +1025,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+         if (pm->pcihp_bridge_en) {
+             build_acpi_pci_hotplug(dsdt, AML_SYSTEM_IO, pm->pcihp_io_base);
+         }
+-        build_q35_pci0_int(dsdt);
++        build_q35_pci0_int(dsdt, pcms->analysis_profile);
+     }
+ 
+     if (misc->has_hpet) {

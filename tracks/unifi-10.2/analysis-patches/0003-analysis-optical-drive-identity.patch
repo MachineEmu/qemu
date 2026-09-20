@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Wed, 16 Sep 2026 02:20:00 +0200
+Subject: [PATCH] hw/ide: expose optical inquiry vendor as a device property
+
+QEMU already lets launchers set IDE model, serial, and firmware revision
+strings per device. Add the missing vendor property and use the resolved IDE
+strings for ATAPI inquiry data. Defaults remain upstream-compatible unless a
+launcher explicitly supplies the property.
+---
+ hw/ide/atapi.c           | 6 +++---
+ hw/ide/core.c            | 6 ++++++
+ include/hw/ide/ide-dev.h | 3 +++
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/hw/ide/atapi.c b/hw/ide/atapi.c
+index 0fcd12e15e..d2effcc8e3 100644
+--- a/hw/ide/atapi.c
++++ b/hw/ide/atapi.c
+@@ -757,6 +757,6 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
+             buf[idx++] = 0x00;
+             buf[idx++] = 68;
+-            padstr8(buf + idx, 8, "ATA"); /* Generic T10 vendor */
++            padstr8(buf + idx, 8, s->drive_vendor_str);
+             idx += 8;
+             padstr8(buf + idx, 40, s->drive_model_str);
+             idx += 40;
+@@ -798,8 +798,8 @@ static void cmd_inquiry(IDEState *s, uint8_t *buf)
+         buf[5] = 0;    /* reserved */
+         buf[6] = 0;    /* reserved */
+         buf[7] = 0;    /* reserved */
+-        padstr8(buf + 8, 8, "QEMU");
+-        padstr8(buf + 16, 16, "QEMU DVD-ROM");
++        padstr8(buf + 8, 8, s->drive_vendor_str);
++        padstr8(buf + 16, 16, s->drive_model_str);
+         padstr8(buf + 32, 4, s->version);
+         idx = 36;
+     }
+diff --git a/hw/ide/core.c b/hw/ide/core.c
+index 910843a111..078d41a370 100644
+--- a/hw/ide/core.c
++++ b/hw/ide/core.c
+@@ -2633,5 +2633,11 @@ int ide_init_drive(IDEState *s, BlockBackend *blk, IDEDriveKind kind,
+                  "QM%05d", s->drive_serial);
+     }
++    if (dev->vendor) {
++        pstrcpy(s->drive_vendor_str, sizeof(s->drive_vendor_str), dev->vendor);
++    } else {
++        pstrcpy(s->drive_vendor_str, sizeof(s->drive_vendor_str), "QEMU");
++    }
++
+     if (dev->model) {
+         pstrcpy(s->drive_model_str, sizeof(s->drive_model_str), dev->model);
+     } else {
+diff --git a/include/hw/ide/ide-dev.h b/include/hw/ide/ide-dev.h
+index fa2566fe86..25b9139a71 100644
+--- a/include/hw/ide/ide-dev.h
++++ b/include/hw/ide/ide-dev.h
+@@ -65,6 +65,7 @@ struct IDEState {
+     uint8_t identify_data[512];
+     int drive_serial;
+     char drive_serial_str[21];
++    char drive_vendor_str[9];
+     char drive_model_str[41];
+     bool win2k_install_hack;
+     uint64_t wwn;
+@@ -159,6 +160,7 @@ struct IDEDevice {
+     int chs_trans;
+     char *version;
+     char *serial;
++    char *vendor;
+     char *model;
+     uint64_t wwn;
+     /*
+@@ -176,6 +178,7 @@ typedef struct IDEDrive {
+     DEFINE_PROP_STRING("ver",  IDEDrive, dev.version),  \
+     DEFINE_PROP_UINT64("wwn",  IDEDrive, dev.wwn, 0),   \
+     DEFINE_PROP_STRING("serial",  IDEDrive, dev.serial),\
++    DEFINE_PROP_STRING("vendor", IDEDrive, dev.vendor), \
+     DEFINE_PROP_STRING("model", IDEDrive, dev.model)
+ 
+ void ide_dev_initfn(IDEDevice *dev, IDEDriveKind kind, Error **errp);
+-- 
+2.45.2

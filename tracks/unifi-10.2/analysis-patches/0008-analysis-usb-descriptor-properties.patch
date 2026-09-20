@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu <analysis-profile@local>
+Date: Wed, 16 Sep 2026 23:55:00 +0200
+Subject: [PATCH] hw/usb: expose analysis USB descriptor properties
+
+Expose optional descriptor identity fields on the USB devices created by the
+analysis launch path: usb-tablet and usb-storage. The properties update the
+guest-visible manufacturer/product strings, VID/PID, and bcdDevice while
+preserving upstream defaults when unset.
+
+Keep the descriptor generation fallback generic, but avoid adding properties to
+the abstract USB parent class so unrelated USB devices and inherited property
+sets remain unchanged.
+---
+ hw/usb/bus.c         |  3 +++
+ hw/usb/desc.c        | 25 +++++++++++++++++--------
+ hw/usb/desc.h        |  2 +-
+ hw/usb/dev-hid.c     |  5 +++++
+ hw/usb/dev-storage.c |  9 +++++++++
+ include/hw/usb.h     |  5 +++++
+ 6 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/hw/usb/bus.c b/hw/usb/bus.c
+index 714e33989f..5e06eeacb8 100644
+--- a/hw/usb/bus.c
++++ b/hw/usb/bus.c
+@@ -232,6 +232,9 @@ static void usb_qdev_realize(DeviceState *qdev, Error **errp)
+ 
+     pstrcpy(dev->product_desc, sizeof(dev->product_desc),
+             usb_device_get_product_desc(dev));
++    if (dev->product) {
++        pstrcpy(dev->product_desc, sizeof(dev->product_desc), dev->product);
++    }
+     dev->auto_attach = 1;
+     QLIST_INIT(&dev->strings);
+     usb_ep_init(dev);
+diff --git a/hw/usb/desc.c b/hw/usb/desc.c
+index f2bdc05a95..3851a44dbb 100644
+--- a/hw/usb/desc.c
++++ b/hw/usb/desc.c
+@@ -6,11 +6,14 @@
+ 
+ /* ------------------------------------------------------------------ */
+ 
+-int usb_desc_device(const USBDescID *id, const USBDescDevice *dev,
++int usb_desc_device(USBDevice *udev, const USBDescID *id, const USBDescDevice *dev,
+                     bool msos, uint8_t *dest, size_t len)
+ {
+     uint8_t bLength = 0x12;
+     USBDescriptor *d = (void *)dest;
++    uint16_t vendorid = udev->vendorid ? udev->vendorid : id->idVendor;
++    uint16_t productid = udev->productid ? udev->productid : id->idProduct;
++    uint16_t bcd_device = udev->bcd_device ? udev->bcd_device : id->bcdDevice;
+ 
+     if (len < bLength) {
+         return -1;
+@@ -36,12 +39,12 @@ int usb_desc_device(const USBDescID *id, const USBDescDevice *dev,
+     d->u.device.bDeviceProtocol    = dev->bDeviceProtocol;
+     d->u.device.bMaxPacketSize0    = dev->bMaxPacketSize0;
+ 
+-    d->u.device.idVendor_lo        = usb_lo(id->idVendor);
+-    d->u.device.idVendor_hi        = usb_hi(id->idVendor);
+-    d->u.device.idProduct_lo       = usb_lo(id->idProduct);
+-    d->u.device.idProduct_hi       = usb_hi(id->idProduct);
+-    d->u.device.bcdDevice_lo       = usb_lo(id->bcdDevice);
+-    d->u.device.bcdDevice_hi       = usb_hi(id->bcdDevice);
++    d->u.device.idVendor_lo        = usb_lo(vendorid);
++    d->u.device.idVendor_hi        = usb_hi(vendorid);
++    d->u.device.idProduct_lo       = usb_lo(productid);
++    d->u.device.idProduct_hi       = usb_hi(productid);
++    d->u.device.bcdDevice_lo       = usb_lo(bcd_device);
++    d->u.device.bcdDevice_hi       = usb_hi(bcd_device);
+     d->u.device.iManufacturer      = id->iManufacturer;
+     d->u.device.iProduct           = id->iProduct;
+     d->u.device.iSerialNumber      = id->iSerialNumber;
+@@ -514,6 +517,12 @@ void usb_desc_init(USBDevice *dev)
+         usb_desc_set_string(dev, 0xee, "MSFT100Q");
+     }
+     usb_desc_setdefaults(dev);
++    if (dev->manufacturer && desc->id.iManufacturer) {
++        usb_desc_set_string(dev, desc->id.iManufacturer, dev->manufacturer);
++    }
++    if (dev->product && desc->id.iProduct) {
++        usb_desc_set_string(dev, desc->id.iProduct, dev->product);
++    }
+ }
+ 
+ void usb_desc_attach(USBDevice *dev)
+@@ -651,7 +660,7 @@ int usb_desc_get_descriptor(USBDevice *dev, USBPacket *p,
+ 
+     switch(type) {
+     case USB_DT_DEVICE:
+-        ret = usb_desc_device(&desc->id, dev->device, msos, buf, buflen);
++        ret = usb_desc_device(dev, &desc->id, dev->device, msos, buf, buflen);
+         trace_usb_desc_device(dev->addr, len, ret);
+         break;
+     case USB_DT_CONFIG:
+diff --git a/hw/usb/desc.h b/hw/usb/desc.h
+index 35babdeff6..49cd18469d 100644
+--- a/hw/usb/desc.h
++++ b/hw/usb/desc.h
+@@ -214,7 +214,7 @@ static inline uint8_t usb_hi(uint16_t val)
+ }
+ 
+ /* generate usb packages from structs */
+-int usb_desc_device(const USBDescID *id, const USBDescDevice *dev,
++int usb_desc_device(USBDevice *udev, const USBDescID *id, const USBDescDevice *dev,
+                     bool msos, uint8_t *dest, size_t len);
+ int usb_desc_device_qualifier(const USBDescDevice *dev,
+                               uint8_t *dest, size_t len);
+diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
+index 96623aa322..2affe6c8c9 100644
+--- a/hw/usb/dev-hid.c
++++ b/hw/usb/dev-hid.c
+@@ -797,6 +797,11 @@ static const Property usb_tablet_properties[] = {
+         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
+         DEFINE_PROP_STRING("display", USBHIDState, display),
+         DEFINE_PROP_UINT32("head", USBHIDState, head, 0),
++        DEFINE_PROP_STRING("usb-manufacturer", USBHIDState, dev.manufacturer),
++        DEFINE_PROP_STRING("usb-product", USBHIDState, dev.product),
++        DEFINE_PROP_UINT16("vendorid", USBHIDState, dev.vendorid, 0),
++        DEFINE_PROP_UINT16("productid", USBHIDState, dev.productid, 0),
++        DEFINE_PROP_UINT16("bcd-device", USBHIDState, dev.bcd_device, 0),
+ };
+ 
+ static void usb_tablet_class_initfn(ObjectClass *klass, const void *data)
+diff --git a/hw/usb/dev-storage.c b/hw/usb/dev-storage.c
+index b13fe345c4..dfd03e3c16 100644
+--- a/hw/usb/dev-storage.c
++++ b/hw/usb/dev-storage.c
+@@ -585,6 +585,14 @@ static const VMStateDescription vmstate_usb_msd = {
+     }
+ };
+ 
++static const Property usb_msd_properties[] = {
++    DEFINE_PROP_STRING("usb-manufacturer", MSDState, dev.manufacturer),
++    DEFINE_PROP_STRING("usb-product", MSDState, dev.product),
++    DEFINE_PROP_UINT16("vendorid", MSDState, dev.vendorid, 0),
++    DEFINE_PROP_UINT16("productid", MSDState, dev.productid, 0),
++    DEFINE_PROP_UINT16("bcd-device", MSDState, dev.bcd_device, 0),
++};
++
+ static void usb_msd_class_initfn_common(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -600,6 +608,7 @@ static void usb_msd_class_initfn_common(ObjectClass *klass, const void *data)
+     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+     dc->fw_name = "storage";
+     dc->vmsd = &vmstate_usb_msd;
++    device_class_set_props(dc, usb_msd_properties);
+ }
+ 
+ static const TypeInfo usb_storage_dev_type_info = {
+diff --git a/include/hw/usb.h b/include/hw/usb.h
+index 26a9f3ecde..5235b03164 100644
+--- a/include/hw/usb.h
++++ b/include/hw/usb.h
+@@ -229,6 +229,11 @@ struct USBDevice {
+     USBPort *port;
+     char *port_path;
+     char *serial;
++    char *manufacturer;
++    char *product;
++    uint16_t vendorid;
++    uint16_t productid;
++    uint16_t bcd_device;
+     void *opaque;
+     uint32_t flags;
+ 

@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu <analysis-profile@local>
+Date: Thu, 17 Sep 2026 22:10:00 +0200
+Subject: [PATCH] hw/display: expose opt-in VGA PCI identity properties
+
+The analysis profile already owns the VGA EDID identity, but the PCI config
+space still reports QEMU's 1234:1111 VGA ID. Expose optional qdev properties
+for the PCI vendor/device and subsystem IDs so the opt-in analysis launch path
+can provide a coherent display adapter identity. Also expose a delay knob so a
+profile can let firmware initialize stdvga first, then mutate PCI config-space
+IDs after the graphical boot path is established.
+
+The properties default to zero/immediate and only patch PCI config space when
+explicitly provided, preserving ordinary VGA defaults for normal QEMU launches.
+---
+ hw/display/vga-pci.c | 56 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/hw/display/vga-pci.c b/hw/display/vga-pci.c
+index 51beb1b6f3..b66cb6b2c4 100644
+--- a/hw/display/vga-pci.c
++++ b/hw/display/vga-pci.c
+@@ -49,6 +49,12 @@ struct PCIVGAState {
+     VGACommonState vga;
+     uint32_t flags;
+     qemu_edid_info edid_info;
++    uint16_t pci_vendor_id;
++    uint16_t pci_device_id;
++    uint16_t pci_subsystem_vendor_id;
++    uint16_t pci_subsystem_id;
++    uint32_t pci_identity_delay_ms;
++    QEMUTimer *pci_identity_timer;
+     MemoryRegion mmio;
+     MemoryRegion mrs[4];
+     uint8_t edid[384];
+@@ -233,6 +239,47 @@ void pci_std_vga_mmio_region_init(VGACommonState *s,
+     }
+ }
+ 
++static bool pci_vga_has_identity(PCIVGAState *d)
++{
++    return d->pci_vendor_id || d->pci_device_id ||
++           d->pci_subsystem_vendor_id || d->pci_subsystem_id;
++}
++
++static void pci_vga_apply_identity(void *opaque)
++{
++    PCIVGAState *d = opaque;
++
++    if (d->pci_vendor_id) {
++        pci_set_word(d->dev.config + PCI_VENDOR_ID, d->pci_vendor_id);
++    }
++    if (d->pci_device_id) {
++        pci_set_word(d->dev.config + PCI_DEVICE_ID, d->pci_device_id);
++    }
++    if (d->pci_subsystem_vendor_id) {
++        pci_set_word(d->dev.config + PCI_SUBSYSTEM_VENDOR_ID,
++                     d->pci_subsystem_vendor_id);
++    }
++    if (d->pci_subsystem_id) {
++        pci_set_word(d->dev.config + PCI_SUBSYSTEM_ID, d->pci_subsystem_id);
++    }
++}
++
++static void pci_vga_maybe_apply_identity(PCIVGAState *d)
++{
++    if (!pci_vga_has_identity(d)) {
++        return;
++    }
++    if (!d->pci_identity_delay_ms) {
++        pci_vga_apply_identity(d);
++        return;
++    }
++    d->pci_identity_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                                         pci_vga_apply_identity, d);
++    timer_mod(d->pci_identity_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++              d->pci_identity_delay_ms);
++}
++
+ static void pci_std_vga_realize(PCIDevice *dev, Error **errp)
+ {
+     PCIVGAState *d = PCI_VGA(dev);
+@@ -244,6 +291,7 @@ static void pci_std_vga_realize(PCIDevice *dev, Error **errp)
+     if (!vga_common_init(s, OBJECT(dev), errp)) {
+         return;
+     }
++    pci_vga_maybe_apply_identity(d);
+     vga_init(s, OBJECT(dev), pci_address_space(dev), pci_address_space_io(dev),
+              true);
+ 
+@@ -282,6 +330,7 @@ static void pci_secondary_vga_realize(PCIDevice *dev, Error **errp)
+     if (!vga_common_init(s, OBJECT(dev), errp)) {
+         return;
+     }
++    pci_vga_maybe_apply_identity(d);
+     s->con = graphic_console_init(DEVICE(dev), 0, s->hw_ops, s);
+ 
+     /* mmio bar */
+@@ -338,6 +387,13 @@ static const Property vga_pci_properties[] = {
+     DEFINE_PROP_BIT("edid",
+                     PCIVGAState, flags, PCI_VGA_FLAG_ENABLE_EDID, true),
+     DEFINE_EDID_PROPERTIES(PCIVGAState, edid_info),
++    DEFINE_PROP_UINT16("pci-vendor-id", PCIVGAState, pci_vendor_id, 0),
++    DEFINE_PROP_UINT16("pci-device-id", PCIVGAState, pci_device_id, 0),
++    DEFINE_PROP_UINT16("pci-subsystem-vendor-id", PCIVGAState,
++                       pci_subsystem_vendor_id, 0),
++    DEFINE_PROP_UINT16("pci-subsystem-id", PCIVGAState, pci_subsystem_id, 0),
++    DEFINE_PROP_UINT32("pci-identity-delay-ms", PCIVGAState,
++                       pci_identity_delay_ms, 0),
+     DEFINE_PROP_BOOL("global-vmstate", PCIVGAState, vga.global_vmstate, false),
+ };
+ 
+-- 
+2.45.2

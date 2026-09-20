@@ -7,9 +7,10 @@ MachineEmu-owned code is currently licensed under AGPL-3.0-or-later. Imported
 QEMU and third-party components retain their upstream licenses and notices.
 
 The first Rust migration slice contains `board-core`, `net-offload`, the three
-board model crates, `board-ffi`, and `board-tools`. Display, audio, remote
-device, and analysis crates remain in the source repository until their own
-milestones.
+board model crates, `board-ffi`, and `board-tools`. The deterministic
+`analysis-profile` validation/identity crate, the dedicated QEMU analysis patch
+series, and the opt-in host-kernel guard scaffold are now migrated; a clean
+analysis-engine build and privileged kernel validation remain milestone work.
 
 The `unifi-10.2` fetch and build scripts now work from this checkout: the
 preflight fetched QEMU 10.2.4, applied all 11 patches, compiled `board-ffi`,

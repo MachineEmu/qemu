@@ -1,0 +1,13 @@
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 9c53c658eb..ea13dc53d7 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -699,7 +699,7 @@ static Aml *build_q35_routing_table(const char *str, bool analysis_profile)
+     int i;
+     Aml *pkg;
+     char *name = g_strdup_printf("%s ", str);
+-    bool add_analysis_sentinel = analysis_profile && g_str_equal(str, "GSI");
++    bool add_analysis_sentinel = analysis_profile && !g_str_equal(str, "LNK");
+ 
+     pkg = aml_package(add_analysis_sentinel ? 132 : 128);
+     for (i = 0; i < 0x18; i++) {

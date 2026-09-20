@@ -1,0 +1,30 @@
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 7285af9ce9..bdb227c171 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -1988,6 +1988,12 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
+     acpi_get_pci_holes(&pci_hole, &pci_hole64);
+     acpi_get_slic_oem(&slic_oem);
+ 
++    if (pcms->analysis_profile) {
++        /* Avoid QEMU's literal unsupported-C-state latency signature. */
++        pm.fadt.plvl2_lat = 0;
++        pm.fadt.plvl3_lat = 0;
++    }
++
+     if (slic_oem.id) {
+         oem_id = slic_oem.id;
+     } else {
+@@ -2173,8 +2179,10 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
+                        x86ms->oem_id, x86ms->oem_table_id, &pcms->cxl_devices_state);
+     }
+ 
+-    acpi_add_table(table_offsets, tables_blob);
+-    build_waet(tables_blob, tables->linker, x86ms->oem_id, x86ms->oem_table_id);
++    if (!pcms->analysis_profile) {
++        acpi_add_table(table_offsets, tables_blob);
++        build_waet(tables_blob, tables->linker, x86ms->oem_id, x86ms->oem_table_id);
++    }
+ 
+     /* Add tables supplied by user (if any) */
+     for (u = acpi_table_first(); u; u = acpi_table_next(u)) {

@@ -1,0 +1,39 @@
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index e79dd2ef38..da841931e5 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -381,7 +381,7 @@ static Aml *build_prt(bool is_pci0_prt)
+     return method;
+ }
+ 
+-static void build_hpet_aml(Aml *table)
++static void build_hpet_aml(Aml *table, bool analysis_profile)
+ {
+     Aml *crs;
+     Aml *field;
+@@ -392,6 +392,7 @@ static void build_hpet_aml(Aml *table)
+     Aml *zero = aml_int(0);
+     Aml *id = aml_local(0);
+     Aml *period = aml_local(1);
++    uint64_t max_period = analysis_profile ? 100000001ULL : 100000000ULL;
+ 
+     aml_append(dev, aml_name_decl("_HID", aml_eisaid("PNP0103")));
+     aml_append(dev, aml_name_decl("_UID", zero));
+@@ -416,7 +417,7 @@ static void build_hpet_aml(Aml *table)
+     aml_append(method, if_ctx);
+ 
+     if_ctx = aml_if(aml_lor(aml_equal(period, zero),
+-                            aml_lgreater(period, aml_int(100000000))));
++                            aml_lgreater(period, aml_int(max_period))));
+     {
+         aml_append(if_ctx, aml_return(zero));
+     }
+@@ -1029,7 +1030,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+     }
+ 
+     if (misc->has_hpet) {
+-        build_hpet_aml(dsdt);
++        build_hpet_aml(dsdt, pcms->analysis_profile);
+     }
+ 
+     if (vmbus_bridge) {

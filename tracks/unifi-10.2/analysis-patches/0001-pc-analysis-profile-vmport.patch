@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Wed, 16 Sep 2026 02:00:00 +0200
+Subject: [PATCH] hw/i386: add opt-in analysis profile PC setting
+
+Add an explicit PC machine property for the opt-in malware-analysis build.
+When enabled, the property disables the optional VMware backdoor/VMPort
+compatibility interface.  It is deliberately opt-in and does not alter
+ordinary PC or Q35 machines.
+
+The property is separate from CPU, firmware, and ACPI identity handling so
+those signals can be evaluated independently against guest checks.
+---
+ hw/i386/pc.c        | 27 +++++++++++++++++++++++++++
+ include/hw/i386/pc.h |  2 ++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 48e153c93f..ddea077a97 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1489,6 +1489,27 @@ static void pc_machine_set_vmport(Object *obj, Visitor *v, const char *name,
+     visit_type_OnOffAuto(v, name, &pcms->vmport, errp);
+ }
+ 
++static bool pc_machine_get_analysis_profile(Object *obj, Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++
++    return pcms->analysis_profile;
++}
++
++static void pc_machine_set_analysis_profile(Object *obj, bool value,
++                                            Error **errp)
++{
++    PCMachineState *pcms = PC_MACHINE(obj);
++
++    pcms->analysis_profile = value;
++    if (value) {
++        /* The VMware backdoor is an optional compatibility interface.  An
++         * analysis guest should not expose it unless a profile explicitly
++         * enables it, because it is a common virtualization probe. */
++        pcms->vmport = ON_OFF_AUTO_OFF;
++    }
++}
++
+ static bool pc_machine_get_fd_bootchk(Object *obj, Error **errp)
+ {
+     PCMachineState *pcms = PC_MACHINE(obj);
+@@ -1817,6 +1838,12 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, PC_MACHINE_SMBIOS_EP,
+         "SMBIOS Entry Point type [32, 64]");
+ 
++    object_class_property_add_bool(oc, PC_MACHINE_ANALYSIS_PROFILE,
++        pc_machine_get_analysis_profile,
++        pc_machine_set_analysis_profile);
++    object_class_property_set_description(oc, PC_MACHINE_ANALYSIS_PROFILE,
++        "Enable opt-in malware-analysis PC compatibility settings");
++
+     object_class_property_add_bool(oc, "fd-bootchk",
+         pc_machine_get_fd_bootchk,
+         pc_machine_set_fd_bootchk);
+ 
+diff --git a/include/hw/i386/pc.h b/include/hw/i386/pc.h
+index e83157ab35..85d75983b3 100644
+--- a/include/hw/i386/pc.h
++++ b/include/hw/i386/pc.h
+@@ -50,6 +50,7 @@ typedef struct PCMachineState {
+     bool hpet_enabled;
+     bool i8042_enabled;
+     bool default_bus_bypass_iommu;
++    bool analysis_profile;
+     bool fd_bootchk;
+     uint64_t max_fw_size;
+ 
+@@ -68,6 +69,7 @@ typedef struct PCMachineState {
+ #define PC_MACHINE_I8042            "i8042"
+ #define PC_MACHINE_MAX_FW_SIZE      "max-fw-size"
+ #define PC_MACHINE_SMBIOS_EP        "smbios-entry-point-type"
++#define PC_MACHINE_ANALYSIS_PROFILE "analysis-profile"
+ 
+ /**
+  * PCMachineClass:
+-- 
+2.45.2

@@ -1,0 +1,119 @@
+diff --git a/hw/acpi/cpu.c b/hw/acpi/cpu.c
+index 6f1ae79edb..04f23b5172 100644
+--- a/hw/acpi/cpu.c
++++ b/hw/acpi/cpu.c
+@@ -363,7 +363,9 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+         aml_append(cpu_ctrl_dev,
+             aml_name_decl("_HID", aml_eisaid("PNP0A06")));
+         aml_append(cpu_ctrl_dev,
+-            aml_name_decl("_UID", aml_string("CPU Hotplug resources")));
++            aml_name_decl("_UID", aml_string(opts.analysis_profile ?
++                                             "Processor resources" :
++                                             "CPU Hotplug resources")));
+         aml_append(cpu_ctrl_dev, aml_mutex(CPU_LOCK, 0));
+ 
+         assert((rs == AML_SYSTEM_IO) || (rs == AML_SYSTEM_MEMORY));
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 9446a9f862..7285af9ce9 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -788,13 +788,14 @@ static void build_q35_pci0_int(Aml *table)
+     aml_append(table, sb_scope);
+ }
+ 
+-static Aml *build_q35_dram_controller(const AcpiMcfgInfo *mcfg)
++static Aml *build_q35_dram_controller(const AcpiMcfgInfo *mcfg,
++                                      bool analysis_profile)
+ {
+     Aml *dev;
+     Aml *resource_template;
+ 
+     /* DRAM controller */
+-    dev = aml_device("DRAC");
++    dev = aml_device(analysis_profile ? "MCRS" : "DRAC");
+     aml_append(dev, aml_name_decl("_HID", aml_string("PNP0C01")));
+ 
+     resource_template = aml_resource_template();
+@@ -878,7 +951,9 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+     acpi_table_begin(&table, table_data);
+     dsdt = init_aml_allocator();
+ 
+-    build_dbg_aml(dsdt);
++    if (!pcms->analysis_profile) {
++        build_dbg_aml(dsdt);
++    }
+     if (i440fx) {
+         sb_scope = aml_scope("_SB");
+         dev = aml_device("PCI0");
+@@ -902,14 +977,19 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+         aml_append(dev, build_pci_bridge_edsm());
+         aml_append(sb_scope, dev);
+         if (mcfg_valid) {
+-            aml_append(sb_scope, build_q35_dram_controller(&mcfg));
++            aml_append(sb_scope,
++                       build_q35_dram_controller(&mcfg,
++                                                 pcms->analysis_profile));
+         }
+ 
+         if (pm->smi_on_cpuhp) {
+             /* reserve SMI block resources, IO ports 0xB2, 0xB3 */
+-            dev = aml_device("PCI0.SMI0");
++            dev = aml_device(pcms->analysis_profile ? "PCI0.PMI0" :
++                             "PCI0.SMI0");
+             aml_append(dev, aml_name_decl("_HID", aml_eisaid("PNP0A06")));
+-            aml_append(dev, aml_name_decl("_UID", aml_string("SMI resources")));
++            aml_append(dev, aml_name_decl("_UID",
++                aml_string(pcms->analysis_profile ? "PM resources" :
++                           "SMI resources")));
+             crs = aml_resource_template();
+             aml_append(crs,
+                 aml_io(
+@@ -965,7 +1045,10 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+     } else {
+         CPUHotplugFeatures opts = {
+             .acpi_1_compatible = true, .has_legacy_cphp = true,
+-            .smi_path = pm->smi_on_cpuhp ? "\\_SB.PCI0.SMI0.SMIC" : NULL,
++            .analysis_profile = pcms->analysis_profile,
++            .smi_path = pm->smi_on_cpuhp ?
++                (pcms->analysis_profile ? "\\_SB.PCI0.PMI0.SMIC" :
++                 "\\_SB.PCI0.SMI0.SMIC") : NULL,
+             .fw_unplugs_cpu = pm->smi_on_cpu_unplug,
+         };
+         build_cpus_aml(dsdt, machine, opts, pc_madt_cpu_entry,
+@@ -1128,9 +1211,12 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+     aml_append(scope, aml_name_decl("_CRS", crs));
+ 
+     /* reserve GPE0 block resources */
+-    dev = aml_device("GPE0");
++    dev = aml_device(pcms->analysis_profile ? "GPR0" : "GPE0");
+     aml_append(dev, aml_name_decl("_HID", aml_string("PNP0A06")));
+-    aml_append(dev, aml_name_decl("_UID", aml_string("GPE0 resources")));
++    aml_append(dev, aml_name_decl("_UID",
++                                  aml_string(pcms->analysis_profile ?
++                                             "Event resources" :
++                                             "GPE0 resources")));
+     /* device present, functioning, decoding, not shown in UI */
+     aml_append(dev, aml_name_decl("_STA", aml_int(0xB)));
+     crs = aml_resource_template();
+@@ -1148,7 +1234,8 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+     crs_range_set_free(&crs_range_set);
+ 
+     /* reserve PCIHP resources */
+-    if (pm->pcihp_io_len && (pm->pcihp_bridge_en || pm->pcihp_root_en)) {
++    if (!pcms->analysis_profile && pm->pcihp_io_len &&
++        (pm->pcihp_bridge_en || pm->pcihp_root_en)) {
+         build_append_pcihp_resources(scope,
+                                       pm->pcihp_io_base, pm->pcihp_io_len);
+     }
+diff --git a/include/hw/acpi/cpu.h b/include/hw/acpi/cpu.h
+index 32654dc274..b23d2ade9c 100644
+--- a/include/hw/acpi/cpu.h
++++ b/include/hw/acpi/cpu.h
+@@ -55,6 +55,7 @@ void cpu_hotplug_hw_init(MemoryRegion *as, Object *owner,
+ typedef struct CPUHotplugFeatures {
+     bool acpi_1_compatible;
+     bool has_legacy_cphp;
++    bool analysis_profile;
+     bool fw_unplugs_cpu;
+     const char *smi_path;
+ } CPUHotplugFeatures;

@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: unifi-qemu maintainers <qemu@localhost>
+Date: Wed, 16 Sep 2026 02:10:00 +0200
+Subject: [PATCH] pc-q35: match analysis AHCI controller port count
+
+The common analysis device profile models ICH9 AHCI as a two-port controller.
+Keep this change in the dedicated analysis series so ordinary Q35 builds from
+the common patch set still expose upstream-compatible defaults.
+---
+ hw/i386/pc_q35.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/hw/i386/pc_q35.c b/hw/i386/pc_q35.c
+index 8a17383985..9ea51ec674 100644
+--- a/hw/i386/pc_q35.c
++++ b/hw/i386/pc_q35.c
+@@ -63,8 +63,8 @@
+ #include "hw/uefi/var-service-api.h"
+ #include "hw/i386/acpi-build.h"
+ #include "target/i386/cpu.h"
+ 
+-/* ICH9 AHCI has 6 ports */
+-#define MAX_SATA_PORTS     6
++/* Analysis profile models the common two-port desktop AHCI surface. */
++#define MAX_SATA_PORTS     2
+ 
+ static GlobalProperty pc_q35_compat_defaults[] = {
+     { TYPE_VIRTIO_IOMMU_PCI, "aw-bits", "39" },
+-- 
+2.45.2
