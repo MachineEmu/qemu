@@ -1,7 +1,8 @@
-use analysis_profile::{clone_identity_json, validate_json};
+use analysis_profile::{acpi_dump_json, clone_identity_json, validate_json};
 use std::{
     env, fs,
     io::{self, Read},
+    path::{Path, PathBuf},
 };
 
 fn input(path: Option<String>) -> io::Result<String> {
@@ -29,9 +30,39 @@ fn main() {
                 "usage: analysis-profile clone-identity <seed> <clone-id>",
             )),
         },
+        Some("acpi-dump") => {
+            let mut metadata_only = false;
+            let mut output_dir: Option<PathBuf> = None;
+            let parsed = (|| {
+                while let Some(argument) = args.next() {
+                    match argument.as_str() {
+                        "--metadata-only" => metadata_only = true,
+                        "--output-dir" => {
+                            output_dir = Some(PathBuf::from(args.next().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "--output-dir requires DIR",
+                                )
+                            })?));
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "usage: analysis-profile acpi-dump [--metadata-only] [--output-dir DIR]",
+                            ));
+                        }
+                    }
+                }
+                Ok::<(), io::Error>(())
+            })();
+            parsed.and_then(|_| {
+                acpi_dump_json(Path::new("/"), !metadata_only, output_dir.as_deref())
+                    .map_err(io::Error::other)
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: analysis-profile validate [json-file] | clone-identity <seed> <clone-id>",
+            "usage: analysis-profile validate [json-file] | clone-identity <seed> <clone-id> | acpi-dump [--metadata-only] [--output-dir DIR]",
         )),
     };
     match result {
