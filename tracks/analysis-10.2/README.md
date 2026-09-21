@@ -98,12 +98,23 @@ Identifiers are written the way `lspci` and `lsusb` write them: the inventory
 carries `"vendor_id": "0x8086"`, while `analysis.pci` keeps the numeric form
 that QEMU's properties take.
 
-What it deliberately does not copy is the identity that is unique to one
-machine: the system UUID, MAC and DMI serial numbers stay derived from the
-seed. A literal copy would put a duplicate UUID and MAC on the same network as
-the host, and any malware that phones home would report the host's real
-identifiers. The output is an ordinary profile input, so `validate` accepts it
-directly.
+The command has two modes. With a seed, the identity that is unique to one
+machine -- the system UUID, MAC and every serial -- is derived from that seed
+rather than copied, so the clone can run beside the host it was taken from. A
+derived value keeps the shape of the one it stands in for: a drive serial of
+`S7DPNU0X909340K` becomes another fifteen characters with digits where digits
+were, because a serial replaced by `AN-03AC6742` announces itself to anything
+that knows what a real one looks like.
+
+With no seed, the clone is literal: the host's own UUID, MAC and serials go in
+as a resolved identity, and `identity_source` records that they came from the
+machine. That guest is an exact twin, which also means it collides with the
+host on the same network and reports the host's real identifiers if it phones
+home, so nothing produces it by default.
+
+The inventory always records what was observed, including the serials the
+seeded profile does not use. Either mode's output is an ordinary profile
+input, so `validate` accepts it directly.
 
 The output carries two layers. `inventory` is everything the host reported:
 every display with its decoded EDID, every block device, PCI function, USB

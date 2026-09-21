@@ -66,7 +66,7 @@ fn main() {
             let usage = || {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "usage: analysis-profile host-clone <seed> [--root DIR]",
+                    "usage: analysis-profile host-clone [seed] [--root DIR]",
                 )
             };
             let parsed = (|| {
@@ -77,13 +77,16 @@ fn main() {
                         _ => return Err(usage()),
                     }
                 }
-                seed.clone().ok_or_else(usage)
+                // With no seed the clone is literal: the host's own UUID, MAC
+                // and serials, rather than values derived from a secret.
+                Ok(seed.clone())
             })();
-            parsed.and_then(|seed| host_clone_json(&root, &seed).map_err(io::Error::other))
+            parsed
+                .and_then(|seed| host_clone_json(&root, seed.as_deref()).map_err(io::Error::other))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: analysis-profile validate [json-file] | clone-identity <seed> <clone-id> | acpi-dump [--metadata-only] [--output-dir DIR] | host-clone <seed> [--root DIR]",
+            "usage: analysis-profile validate [json-file] | clone-identity <seed> <clone-id> | acpi-dump [--metadata-only] [--output-dir DIR] | host-clone [seed] [--root DIR]",
         )),
     };
     match result {

@@ -429,6 +429,43 @@ pub fn acpi_dump_json(
     }))?)
 }
 
+/// Derive a stand-in for a host value that keeps the shape of the original.
+///
+/// A serial replaced by `AN-03AC6742` announces itself: real drives, boards
+/// and monitors have their own formats, and a guest that knows what a Samsung
+/// serial looks like can tell at a glance. This substitutes each character
+/// with one of the same class -- digit for digit, letter for letter, case
+/// preserved -- and leaves punctuation and spacing alone, so the result is as
+/// unremarkable as the value it stands in for while still being a function of
+/// the seed rather than of the host.
+fn derive_like(template: &str, seed: &str, label: &str) -> String {
+    let digest = hash(seed, label);
+    let mut bytes = digest.iter().cycle();
+    template
+        .chars()
+        .map(|character| {
+            let byte = *bytes.next().expect("cycled digest is infinite");
+            if character.is_ascii_digit() {
+                char::from(b'0' + byte % 10)
+            } else if character.is_ascii_uppercase() {
+                char::from(b'A' + byte % 26)
+            } else if character.is_ascii_lowercase() {
+                char::from(b'a' + byte % 26)
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// A serial for a device the host did not report one for.
+///
+/// Twelve uppercase alphanumerics is the shape most drives and boards use, so
+/// it stands out less than a labelled string would.
+fn derive_serial(seed: &str, label: &str) -> String {
+    derive_like("ABC123DEF456", seed, label)
+}
+
 /// Read a sysfs or procfs value, rejecting anything unusable as an identity
 /// string. Sysfs happily returns empty files and NUL bytes on partially
 /// populated firmware tables, and a profile carrying those would fail
@@ -750,6 +787,19 @@ fn number(path: &Path) -> Option<u64> {
     host_string(path)?.parse().ok()
 }
 
+/// An EDID text descriptor: up to 13 bytes, ended by 0x0A and padded with
+/// spaces. Reading the whole field instead of stopping at the terminator
+/// carries the padding, and whatever the panel left after it, into the value.
+fn edid_text(block: &[u8]) -> Option<String> {
+    let bytes = block.get(5..18)?;
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0x0A)
+        .unwrap_or(bytes.len());
+    let value = String::from_utf8_lossy(&bytes[..end]).trim().to_owned();
+    (!value.is_empty() && !value.contains('\0')).then_some(value)
+}
+
 /// Decode the fields of an EDID block that describe the panel.
 ///
 /// The serial number in bytes 12-15 and the 0xFF descriptor are read past on
@@ -779,6 +829,10 @@ fn parse_edid(edid: &[u8]) -> Option<serde_json::Map<String, Value>> {
         "product_id".into(),
         Value::from(u16::from_le_bytes([edid[10], edid[11]])),
     );
+    let serial_number = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+    if serial_number != 0 {
+        display.insert("serial_number".into(), Value::from(serial_number));
+    }
     // Week 0 and year 0 mean the monitor did not record a build date.
     if edid[16] > 0 && edid[16] <= 54 {
         display.insert("manufacture_week".into(), Value::from(edid[16]));
@@ -796,14 +850,10 @@ fn parse_edid(edid: &[u8]) -> Option<serde_json::Map<String, Value>> {
     // The four 18-byte descriptors at 54 hold the monitor name (0xFC) and the
     // preferred timing, whose resolution is split across nibbles.
     for block in edid[54..126].chunks(18) {
-        if block[0..3] == [0, 0, 0] && block[3] == 0xFC {
-            let name = String::from_utf8_lossy(&block[5..18])
-                .trim_end_matches(['\n', ' '])
-                .trim()
-                .to_owned();
-            if !name.is_empty() && !name.contains('\0') {
-                display.insert("name".into(), Value::String(name));
-            }
+        if block[0..3] == [0, 0, 0] && block[3] == 0xFF {
+            insert_string(&mut display, "serial", edid_text(block));
+        } else if block[0..3] == [0, 0, 0] && block[3] == 0xFC {
+            insert_string(&mut display, "name", edid_text(block));
         } else if block[0..2] != [0, 0] && !display.contains_key("xres") {
             let xres = block[2] as u64 | (((block[4] as u64) & 0xf0) << 4);
             let yres = block[5] as u64 | (((block[7] as u64) & 0xf0) << 4);
@@ -878,7 +928,17 @@ fn host_block_devices(root: &Path) -> Vec<Value> {
         );
         insert_string(&mut item, "vendor", host_string(&device.join("vendor")));
         insert_string(&mut item, "model", host_string(&device.join("model")));
-        insert_string(&mut item, "revision", host_string(&device.join("rev")));
+        // SCSI calls it `rev`, NVMe calls it `firmware_rev`, and a guest reads
+        // whichever its own controller reports.
+        insert_string(
+            &mut item,
+            "firmware_rev",
+            host_string(&device.join("rev")).or_else(|| host_string(&device.join("firmware_rev"))),
+        );
+        // The drive's own serial. It identifies this machine, so the profile
+        // derives a stand-in of the same shape rather than copying it; it is
+        // recorded here because the inventory is evidence.
+        insert_string(&mut item, "serial", host_string(&device.join("serial")));
         // Sysfs reports capacity in 512-byte sectors regardless of the
         // device's own block size.
         if let Some(sectors) = number(&path.join("size")) {
@@ -947,10 +1007,7 @@ fn host_usb_devices(root: &Path) -> Vec<Value> {
     devices
 }
 
-/// Network interfaces, by model rather than by address.
-///
-/// The MAC is the one value here that identifies this machine, so it is left
-/// out; the guest's MAC is derived from the seed.
+/// Network interfaces: model, driver, link state and address.
 fn host_network_devices(root: &Path) -> Vec<Value> {
     let mut devices = Vec::new();
     for path in sorted_dir(&root.join("sys/class/net")) {
@@ -974,6 +1031,9 @@ fn host_network_devices(root: &Path) -> Vec<Value> {
         if let Ok(driver) = fs::read_link(path.join("device/driver")) {
             item.insert("driver".into(), Value::String(file_name(&driver)));
         }
+        // The one value here that identifies this machine. A seeded profile
+        // derives its MAC instead; a literal clone uses this one.
+        insert_string(&mut item, "mac", host_string(&path.join("address")));
         insert_string(&mut item, "operstate", host_string(&path.join("operstate")));
         if let Some(speed) = host_string(&path.join("speed")).and_then(|v| v.parse::<i64>().ok())
             && speed > 0
@@ -1114,7 +1174,7 @@ fn pci_defaults(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<S
 /// connector, and a fixed disk over removable media.
 fn device_descriptors(
     inventory: &serde_json::Map<String, Value>,
-    seed_hash: &str,
+    seed: Option<&str>,
 ) -> serde_json::Map<String, Value> {
     let blocks = inventory["block_devices"].as_array().expect("array");
     let mut storage = serde_json::Map::new();
@@ -1137,11 +1197,23 @@ fn device_descriptors(
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         );
-        storage.insert("source_device".into(), disk["name"].clone());
-        storage.insert(
-            "disk_serial_prefix".into(),
-            Value::String(format!("AN-{}", seed_hash[..8].to_uppercase())),
+        insert_string(
+            &mut storage,
+            "disk_firmware_rev",
+            field(disk, "firmware_rev")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         );
+        storage.insert("source_device".into(), disk["name"].clone());
+        // With a seed, the drive's serial becomes one of the same shape; with
+        // none, the clone is literal and carries the host's own.
+        let observed = field(disk, "serial").and_then(Value::as_str);
+        let serial = match (seed, observed) {
+            (Some(seed), Some(observed)) => Some(derive_like(observed, seed, "disk-serial")),
+            (Some(seed), None) => Some(derive_serial(seed, "disk-serial")),
+            (None, observed) => observed.map(str::to_owned),
+        };
+        insert_string(&mut storage, "disk_serial_prefix", serial);
     }
     if let Some(optical) = blocks.iter().find(|device| device["kind"] == "optical") {
         insert_string(
@@ -1155,6 +1227,13 @@ fn device_descriptors(
             &mut storage,
             "optical_product",
             field(optical, "model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        insert_string(
+            &mut storage,
+            "optical_firmware_rev",
+            field(optical, "firmware_rev")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         );
@@ -1173,12 +1252,20 @@ fn device_descriptors(
         if let Some(connector) = display.remove("connector") {
             display.insert("source_connector".into(), connector);
         }
-        // The monitor's own serial, like the machine's, stays derived: the
-        // number in the EDID identifies the panel on the host's desk.
-        display.insert(
-            "serial".into(),
-            Value::String(format!("AN-{}", seed_hash[8..16].to_uppercase())),
-        );
+        // The monitor's own serial identifies the panel on the host's desk,
+        // so a seeded profile substitutes one of the same shape.
+        display.remove("serial_number");
+        if let Some(seed) = seed {
+            let observed = display
+                .get("serial")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let serial = match observed {
+                Some(observed) => derive_like(&observed, seed, "display-serial"),
+                None => derive_serial(seed, "display-serial"),
+            };
+            display.insert("serial".into(), Value::String(serial));
+        }
     }
 
     let mut descriptors = serde_json::Map::new();
@@ -1230,6 +1317,77 @@ fn sensors(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<String
     sensors
 }
 
+/// The host's own identity, for a clone taken without a seed.
+///
+/// The system UUID and the DMI serials live in the raw SMBIOS table, which is
+/// root-only, so an unprivileged literal clone carries whatever it could read
+/// and leaves the rest empty.
+fn host_identity(
+    root: &Path,
+    dmi: &[DmiStructure],
+    inventory: &serde_json::Map<String, Value>,
+) -> Identity {
+    let system = dmi.iter().find(|item| item.kind == 1);
+    // SMBIOS stores the UUID with the first three groups little-endian.
+    let uuid = system
+        .and_then(|system| system.data.get(8..24))
+        .map(|bytes| {
+            format!(
+                "{}-{}-{}-{}-{}",
+                hex(&[bytes[3], bytes[2], bytes[1], bytes[0]]),
+                hex(&[bytes[5], bytes[4]]),
+                hex(&[bytes[7], bytes[6]]),
+                hex(&bytes[8..10]),
+                hex(&bytes[10..16])
+            )
+        })
+        .or_else(|| host_string(&root.join("sys/class/dmi/id/product_uuid")))
+        .unwrap_or_default();
+    // The interface that is actually up is the one the host is reached on.
+    let interfaces = inventory["network_devices"].as_array().expect("array");
+    let mac = interfaces
+        .iter()
+        .find(|item| item["operstate"] == "up")
+        .or_else(|| interfaces.first())
+        .and_then(|item| item.get("mac"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mut serials = BTreeMap::new();
+    for (kind, structure, offset) in [("system", 1u8, 7usize), ("board", 2, 7), ("chassis", 3, 7)] {
+        if let Some(serial) = dmi
+            .iter()
+            .find(|item| item.kind == structure)
+            .and_then(|item| item.text(offset))
+        {
+            serials.insert(kind.to_owned(), serial);
+        }
+    }
+    if let Some(processor) = dmi
+        .iter()
+        .find(|item| item.kind == 4)
+        .and_then(|item| item.text(0x20))
+    {
+        serials.insert("processor".into(), processor);
+    }
+    if let Some(memory) = dmi
+        .iter()
+        .filter(|item| item.kind == 17)
+        .find_map(|item| item.text(0x18))
+    {
+        serials.insert("memory".into(), memory);
+    }
+    if let Some(disk) = inventory["block_devices"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find_map(|item| item.get("serial").and_then(Value::as_str))
+    {
+        serials.insert("disk".into(), disk.to_owned());
+    }
+    Identity { uuid, mac, serials }
+}
+
 /// Build an analysis profile that mirrors the host's hardware identity.
 ///
 /// The result is an ordinary profile input: the model-level fields come from
@@ -1237,15 +1395,16 @@ fn sensors(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<String
 /// the clone can run beside the machine it was taken from. Every source is
 /// optional -- a container with no DMI, or a host whose ACPI tables are
 /// root-only, yields a profile with fewer fields rather than an error.
-pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
-    if seed.is_empty() || seed.contains('\0') {
+pub fn host_clone(root: &Path, seed: Option<&str>) -> Result<Value, ProfileError> {
+    if seed.is_some_and(|seed| seed.is_empty() || seed.contains('\0')) {
         return Err(ProfileError::Seed);
     }
-    let seed_hash = hex(&Sha256::digest(seed.as_bytes()));
     let mut analysis = serde_json::Map::new();
     analysis.insert("enabled".into(), Value::Bool(true));
     analysis.insert("profile".into(), Value::String("malware-analysis".into()));
-    analysis.insert("identity_seed".into(), Value::String(seed.to_owned()));
+    if let Some(seed) = seed {
+        analysis.insert("identity_seed".into(), Value::String(seed.to_owned()));
+    }
     let dmi = read_dmi(root);
     let mut inventory = host_inventory(root);
     inventory.insert(
@@ -1262,10 +1421,7 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
         ("smbios", smbios),
         ("acpi", host_acpi(root)),
         ("pci", pci_defaults(&inventory)),
-        (
-            "device_descriptors",
-            device_descriptors(&inventory, &seed_hash),
-        ),
+        ("device_descriptors", device_descriptors(&inventory, seed)),
         ("sensors", sensors(&inventory)),
     ] {
         analysis.insert(key.into(), Value::Object(value));
@@ -1288,6 +1444,27 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
                 .ok()
         })
         .map(|kib| format!("{}GiB", (kib / (1024 * 1024)).max(1)));
+
+    // With no seed the clone is literal: the host's own UUID, MAC and serials
+    // go in as the resolved identity, and the profile carries no seed to
+    // derive from. The guest is then an exact twin of this machine, which also
+    // means it collides with it on the same network, so nothing derives it by
+    // default.
+    if seed.is_none() {
+        let identity = host_identity(root, &dmi, &inventory);
+        analysis.insert("schema_version".into(), Value::from(1));
+        // validate_resolved requires a digest here; with no seed there is
+        // none, so the identity itself is digested. It is a content hash, not
+        // a secret, and the field name is kept for the schema.
+        analysis.insert(
+            "identity_seed_sha256".into(),
+            Value::String(hex(&Sha256::digest(
+                serde_json::to_string(&identity)?.as_bytes(),
+            ))),
+        );
+        analysis.insert("identity".into(), serde_json::to_value(&identity)?);
+        analysis.insert("identity_source".into(), Value::String("host".into()));
+    }
 
     let mut profile = serde_json::Map::new();
     profile.insert("analysis".into(), Value::Object(analysis));
@@ -1323,14 +1500,15 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
         "source".into(),
         serde_json::json!({
             "kind": "host-clone", "os": "Linux", "method": "sysfs",
-            "root": root.display().to_string(), "identity": "derived-from-seed",
+            "root": root.display().to_string(),
+            "identity": if seed.is_some() { "derived-from-seed" } else { "host" },
             "unavailable": unread,
         }),
     );
     Ok(Value::Object(profile))
 }
 
-pub fn host_clone_json(root: &Path, seed: &str) -> Result<String, ProfileError> {
+pub fn host_clone_json(root: &Path, seed: Option<&str>) -> Result<String, ProfileError> {
     Ok(serde_json::to_string_pretty(&host_clone(root, seed)?)?)
 }
 
@@ -1520,6 +1698,8 @@ mod tests {
             std::fs::create_dir_all(&device).unwrap();
             std::fs::write(device.join("model"), model).unwrap();
             std::fs::write(device.join("vendor"), "ATA").unwrap();
+            std::fs::write(device.join("firmware_rev"), "4B2QJXD7").unwrap();
+            std::fs::write(device.join("serial"), "S7DPNU0X909340K").unwrap();
             std::fs::write(device.parent().unwrap().join("removable"), removable).unwrap();
             std::fs::write(device.parent().unwrap().join("size"), "7814037168").unwrap();
         }
@@ -1549,7 +1729,7 @@ mod tests {
         std::fs::write(device.join("subsystem_vendor"), "0x17aa\n").unwrap();
         std::fs::write(device.join("subsystem_device"), "0x2280\n").unwrap();
 
-        let profile = host_clone(&root, "seed").unwrap();
+        let profile = host_clone(&root, Some("seed")).unwrap();
         let analysis = &profile["analysis"];
         assert_eq!(analysis["smbios"]["system_manufacturer"], "LENOVO");
         assert_eq!(analysis["smbios"]["bios_version"], "N32ET75W");
@@ -1575,6 +1755,19 @@ mod tests {
         let storage = &analysis["device_descriptors"]["storage"];
         assert_eq!(storage["disk_product"], "Samsung SSD 990 PRO 4TB");
         assert_eq!(storage["source_device"], "sda");
+        assert_eq!(storage["disk_firmware_rev"], "4B2QJXD7");
+        // The drive's serial is evidence, so the inventory keeps it; the
+        // profile carries a stand-in of the same shape instead.
+        assert_eq!(inventory["block_devices"][0]["serial"], "S7DPNU0X909340K");
+        let derived = storage["disk_serial_prefix"].as_str().unwrap();
+        assert_ne!(derived, "S7DPNU0X909340K");
+        assert_eq!(derived.len(), "S7DPNU0X909340K".len());
+        assert!(
+            derived
+                .chars()
+                .zip("S7DPNU0X909340K".chars())
+                .all(|(left, right)| left.is_ascii_digit() == right.is_ascii_digit())
+        );
         assert_eq!(storage["optical_product"], "DVD-ROM SH-116");
         let display = &analysis["device_descriptors"]["display"];
         assert_eq!(display["source_connector"], "card0-DP-1");
@@ -1597,6 +1790,7 @@ mod tests {
         // The host's serial and UUID must not reach the profile in any form.
         let text = serde_json::to_string(&profile).unwrap();
         assert!(!text.contains("PF2ABCDE"));
+        assert!(!profile["analysis"].to_string().contains("S7DPNU0X909340K"));
         assert!(!text.contains("3f2504e0"));
         // Nor may the monitor's own serial, from the 0xFF descriptor.
         assert!(!text.contains("2Y4XS63"));
@@ -1614,7 +1808,7 @@ mod tests {
     fn host_clone_tolerates_a_host_with_nothing_readable() {
         let root = fixture_root("host-clone-empty");
         std::fs::create_dir_all(&root).unwrap();
-        let profile = host_clone(&root, "seed").unwrap();
+        let profile = host_clone(&root, Some("seed")).unwrap();
         assert_eq!(profile["analysis"]["smbios"], serde_json::json!({}));
         assert_eq!(profile["vcpu"], 1);
         assert!(validate_json(&serde_json::to_string(&profile).unwrap()).is_ok());
@@ -1681,7 +1875,7 @@ mod tests {
         table.extend(dmi_structure(127, 4, &[], &[]));
         std::fs::write(tables.join("DMI"), &table).unwrap();
 
-        let profile = host_clone(&root, "seed").unwrap();
+        let profile = host_clone(&root, Some("seed")).unwrap();
         let smbios = &profile["analysis"]["smbios"];
         assert_eq!(smbios["chassis_asset"], "CHASSIS-ASSET");
         assert_eq!(smbios["chassis_sku"], "SKU-1");
@@ -1706,6 +1900,78 @@ mod tests {
                 .unwrap()
                 .contains("DEADBEEF01")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derived_values_keep_the_shape_of_the_host_value() {
+        let derived = derive_like("2Y4XS63", "seed", "display-serial");
+        assert_eq!(derived.len(), 7);
+        assert_ne!(derived, "2Y4XS63");
+        assert_eq!(derived, derive_like("2Y4XS63", "seed", "display-serial"));
+        assert_ne!(derived, derive_like("2Y4XS63", "other", "display-serial"));
+        // Digit for digit, letter for letter, punctuation left alone.
+        for (left, right) in derived.chars().zip("2Y4XS63".chars()) {
+            assert_eq!(left.is_ascii_digit(), right.is_ascii_digit());
+            assert_eq!(left.is_ascii_uppercase(), right.is_ascii_uppercase());
+        }
+        assert_eq!(derive_like("AB-12:cd", "seed", "x").len(), 8);
+        assert_eq!(&derive_like("AB-12:cd", "seed", "x")[2..3], "-");
+    }
+
+    #[test]
+    fn a_clone_without_a_seed_carries_the_host_identity() {
+        let root = fixture_root("host-clone-literal");
+        let tables = root.join("sys/firmware/dmi/tables");
+        std::fs::create_dir_all(&tables).unwrap();
+        let mut table = Vec::new();
+        // SMBIOS stores the first three UUID groups little-endian.
+        let uuid = [
+            0xe0, 0x04, 0x25, 0x3f, 0x89, 0x4f, 0xd3, 0x11, 0x9a, 0x0c, 0x03, 0x05, 0xe8, 0x2c,
+            0x33, 0x01,
+        ];
+        table.extend(dmi_structure(
+            1,
+            0x1B,
+            &[(4, &[1]), (5, &[2]), (7, &[3]), (8, &uuid)],
+            &["LENOVO", "20XW00BTGE", "PF2ABCDE"],
+        ));
+        table.extend(dmi_structure(2, 0x0F, &[(7, &[1])], &["BOARD-SERIAL"]));
+        table.extend(dmi_structure(127, 4, &[], &[]));
+        std::fs::write(tables.join("DMI"), &table).unwrap();
+        let interface = root.join("sys/class/net/enp1s0/device");
+        std::fs::create_dir_all(&interface).unwrap();
+        std::fs::write(
+            interface.parent().unwrap().join("address"),
+            "3c:fd:fe:9c:5a:41",
+        )
+        .unwrap();
+        std::fs::write(interface.parent().unwrap().join("operstate"), "up").unwrap();
+        let disk = root.join("sys/block/sda/device");
+        std::fs::create_dir_all(&disk).unwrap();
+        std::fs::write(disk.join("serial"), "S7DPNU0X909340K").unwrap();
+
+        let profile = host_clone(&root, None).unwrap();
+        let analysis = &profile["analysis"];
+        assert!(analysis.get("identity_seed").is_none());
+        assert_eq!(analysis["identity_source"], "host");
+        assert_eq!(
+            analysis["identity"]["uuid"],
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+        );
+        assert_eq!(analysis["identity"]["mac"], "3c:fd:fe:9c:5a:41");
+        assert_eq!(analysis["identity"]["serials"]["system"], "PF2ABCDE");
+        assert_eq!(analysis["identity"]["serials"]["board"], "BOARD-SERIAL");
+        assert_eq!(analysis["identity"]["serials"]["disk"], "S7DPNU0X909340K");
+        // The drive's own serial, not a stand-in.
+        assert_eq!(
+            analysis["device_descriptors"]["storage"]["disk_serial_prefix"],
+            "S7DPNU0X909340K"
+        );
+        // It is a resolved profile: no seed to derive from, and it validates.
+        let validated = validate_json(&serde_json::to_string(&profile).unwrap()).unwrap();
+        let validated: Value = serde_json::from_str(&validated).unwrap();
+        assert_eq!(validated["identity"]["mac"], "3c:fd:fe:9c:5a:41");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
