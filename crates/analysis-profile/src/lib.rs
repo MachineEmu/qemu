@@ -546,7 +546,14 @@ impl DmiStructure {
         // Firmware that has nothing to say still fills the field in.
         if value.is_empty()
             || value.contains('\0')
-            || ["Not Specified", "To Be Filled By O.E.M.", "None", "Unknown"].contains(&value)
+            || [
+                "Not Specified",
+                "To Be Filled By O.E.M.",
+                "Default string",
+                "None",
+                "Unknown",
+            ]
+            .contains(&value)
         {
             return None;
         }
@@ -576,19 +583,28 @@ fn parse_dmi(data: &[u8]) -> Vec<DmiStructure> {
         let formatted = data[offset..offset + length].to_vec();
         let mut cursor = offset + length;
         let mut strings = Vec::new();
-        let mut current = Vec::new();
-        while cursor < data.len() {
-            if data[cursor] == 0 {
-                if current.is_empty() {
-                    cursor += 1;
-                    break;
+        // A structure with no strings ends in two NUL bytes, and consuming
+        // only one leaves the walk one byte out of step: it then reads a NUL
+        // as the next type and stops. Type 16, the physical memory array,
+        // carries no strings and sits directly in front of the memory
+        // modules, so the whole DIMM inventory was lost to this.
+        if data.get(cursor) == Some(&0) && data.get(cursor + 1) == Some(&0) {
+            cursor += 2;
+        } else {
+            let mut current = Vec::new();
+            while cursor < data.len() {
+                if data[cursor] == 0 {
+                    if current.is_empty() {
+                        cursor += 1;
+                        break;
+                    }
+                    strings.push(String::from_utf8_lossy(&current).into_owned());
+                    current.clear();
+                } else {
+                    current.push(data[cursor]);
                 }
-                strings.push(String::from_utf8_lossy(&current).into_owned());
-                current.clear();
-            } else {
-                current.push(data[cursor]);
+                cursor += 1;
             }
-            cursor += 1;
         }
         structures.push(DmiStructure {
             kind,
@@ -1025,7 +1041,7 @@ fn host_network_devices(root: &Path) -> Vec<Value> {
             ("device_id", "device/device"),
         ] {
             if let Some(value) = hex_id(&path.join(file)) {
-                item.insert(key.into(), Value::from(value));
+                item.insert(key.into(), hex_value(value, 4));
             }
         }
         if let Ok(driver) = fs::read_link(path.join("device/driver")) {
@@ -1971,6 +1987,10 @@ mod tests {
                 "To Be Filled By O.E.M.",
             ],
         ));
+        // Type 16, the physical memory array, carries no strings and sits
+        // directly in front of the modules: a walk that mishandles the empty
+        // string set stops here and loses every DIMM.
+        table.extend(dmi_structure(16, 0x17, &[], &[]));
         table.extend(dmi_structure(
             17,
             0x54,
@@ -2063,6 +2083,9 @@ mod tests {
             &["LENOVO", "20XW00BTGE", "PF2ABCDE"],
         ));
         table.extend(dmi_structure(2, 0x0F, &[(7, &[1])], &["BOARD-SERIAL"]));
+        // Gigabyte firmware writes this where it has nothing to say; it is
+        // not a serial number.
+        table.extend(dmi_structure(3, 0x16, &[(7, &[1])], &["Default string"]));
         table.extend(dmi_structure(127, 4, &[], &[]));
         std::fs::write(tables.join("DMI"), &table).unwrap();
         let interface = root.join("sys/class/net/enp1s0/device");
@@ -2089,6 +2112,7 @@ mod tests {
         assert_eq!(analysis["identity"]["serials"]["system"], "PF2ABCDE");
         assert_eq!(analysis["identity"]["serials"]["board"], "BOARD-SERIAL");
         assert_eq!(analysis["identity"]["serials"]["disk"], "S7DPNU0X909340K");
+        assert!(analysis["identity"]["serials"].get("chassis").is_none());
         // The drive's own serial, not a stand-in.
         assert_eq!(
             analysis["device_descriptors"]["storage"]["disk_serial_prefix"],
