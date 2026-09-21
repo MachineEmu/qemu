@@ -81,6 +81,25 @@ consumers that need to validate a resolved profile or derive clone identity
 without shelling out. The ABI returns owned JSON strings and uses NULL on
 validation failure so callers can abort before applying partial identity.
 
+`analysis-profile host-clone <seed>` builds a profile from the machine it runs
+on, so a guest reports the hardware model of a real host instead of a
+hand-written identity. It reads DMI, `/proc/cpuinfo`, the DSDT (or FACP) ACPI
+header, the host bridge's PCI subsystem IDs, block device vendor/model, the
+display EDID, and thermal and fan readings.
+
+What it deliberately does not copy is the identity that is unique to one
+machine: the system UUID, MAC and DMI serial numbers stay derived from the
+seed. A literal copy would put a duplicate UUID and MAC on the same network as
+the host, and any malware that phones home would report the host's real
+identifiers. The output is an ordinary profile input, so `validate` accepts it
+directly.
+
+Every source is optional and the command never fails on a missing one; the
+`source.unavailable` list names the sections that came back empty. ACPI tables
+are root-readable only on most distributions, so an unprivileged run reports
+`acpi` there and the profile keeps QEMU's ACPI identity unless the command is
+re-run with privileges.
+
 The `analysis-profile acpi-dump` command captures Linux ACPI sysfs metadata,
 checksums, and SHA-256 digests, with `--metadata-only` and `--output-dir`
 modes for keeping raw tables outside the repository. Permission-limited or

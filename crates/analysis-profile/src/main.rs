@@ -1,4 +1,4 @@
-use analysis_profile::{acpi_dump_json, clone_identity_json, validate_json};
+use analysis_profile::{acpi_dump_json, clone_identity_json, host_clone_json, validate_json};
 use std::{
     env, fs,
     io::{self, Read},
@@ -60,9 +60,30 @@ fn main() {
                     .map_err(io::Error::other)
             })
         }
+        Some("host-clone") => {
+            let mut seed = None;
+            let mut root = PathBuf::from("/");
+            let usage = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: analysis-profile host-clone <seed> [--root DIR]",
+                )
+            };
+            let parsed = (|| {
+                while let Some(argument) = args.next() {
+                    match argument.as_str() {
+                        "--root" => root = PathBuf::from(args.next().ok_or_else(usage)?),
+                        _ if seed.is_none() => seed = Some(argument),
+                        _ => return Err(usage()),
+                    }
+                }
+                seed.clone().ok_or_else(usage)
+            })();
+            parsed.and_then(|seed| host_clone_json(&root, &seed).map_err(io::Error::other))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: analysis-profile validate [json-file] | clone-identity <seed> <clone-id> | acpi-dump [--metadata-only] [--output-dir DIR]",
+            "usage: analysis-profile validate [json-file] | clone-identity <seed> <clone-id> | acpi-dump [--metadata-only] [--output-dir DIR] | host-clone <seed> [--root DIR]",
         )),
     };
     match result {
