@@ -507,8 +507,13 @@ fn host_acpi(root: &Path) -> serde_json::Map<String, Value> {
     let Some(data) = data else {
         return acpi;
     };
+    // These fields are fixed-width and padded, with spaces by some firmware
+    // and NULs by others; AMI writes "A M I" followed by NULs. Trimming only
+    // whitespace dropped the field on every such host.
     let text = |range: std::ops::Range<usize>| {
-        let value = String::from_utf8_lossy(&data[range]).trim().to_owned();
+        let value = String::from_utf8_lossy(&data[range])
+            .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+            .to_owned();
         (!value.is_empty() && !value.contains('\0')).then_some(value)
     };
     let number = |start: usize| {
@@ -526,138 +531,461 @@ fn host_acpi(root: &Path) -> serde_json::Map<String, Value> {
     acpi
 }
 
-/// PCI subsystem identity of the host bridge.
-///
-/// QEMU's fallback subsystem IDs are a Red Hat/QEMU pair that a guest can read
-/// off any device, so the profile replaces them. The host bridge is the device
-/// whose subsystem IDs a real board is guaranteed to carry; devices that report
-/// 0000 are skipped because that is the same tell as the default.
-fn host_pci(root: &Path) -> serde_json::Map<String, Value> {
-    let devices = root.join("sys/bus/pci/devices");
-    let mut pci = serde_json::Map::new();
-    let mut paths: Vec<PathBuf> = fs::read_dir(&devices)
+fn sorted_dir(path: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(path)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .collect();
-    paths.sort();
-    let hex_id = |path: &Path| -> Option<u64> {
-        let value = host_string(path)?;
-        u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
-    };
-    for path in paths {
-        let vendor = hex_id(&path.join("subsystem_vendor"));
-        let device = hex_id(&path.join("subsystem_device"));
-        if let (Some(vendor), Some(device)) = (vendor, device)
-            && vendor != 0
-        {
-            pci.insert("subsystem_vendor_id".into(), Value::from(vendor));
-            pci.insert("subsystem_id".into(), Value::from(device));
-            break;
+    entries.sort();
+    entries
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn hex_id(path: &Path) -> Option<u64> {
+    let value = host_string(path)?;
+    u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+}
+
+fn number(path: &Path) -> Option<u64> {
+    host_string(path)?.parse().ok()
+}
+
+/// Decode the fields of an EDID block that describe the panel.
+///
+/// The serial number in bytes 12-15 and the 0xFF descriptor are read past on
+/// purpose: they identify one physical monitor, so the profile derives a
+/// serial from the seed instead.
+fn parse_edid(edid: &[u8]) -> Option<serde_json::Map<String, Value>> {
+    // A disconnected connector reads back empty, and every real EDID opens
+    // with the same fixed header.
+    if edid.len() < 128 || edid[0..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
+        return None;
+    }
+    // EDID packs the manufacturer as three 5-bit letters, big-endian, in
+    // bytes 8-9; 'A' is 1.
+    let packed = u16::from_be_bytes([edid[8], edid[9]]);
+    let vendor: String = (0..3)
+        .map(|index| (b'A' - 1 + ((packed >> (10 - index * 5)) & 0x1f) as u8) as char)
+        .collect();
+    if !vendor
+        .chars()
+        .all(|character| character.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut display = serde_json::Map::new();
+    display.insert("vendor".into(), Value::String(vendor));
+    display.insert(
+        "product_id".into(),
+        Value::from(u16::from_le_bytes([edid[10], edid[11]])),
+    );
+    // Week 0 and year 0 mean the monitor did not record a build date.
+    if edid[16] > 0 && edid[16] <= 54 {
+        display.insert("manufacture_week".into(), Value::from(edid[16]));
+    }
+    if edid[17] > 0 {
+        display.insert(
+            "manufacture_year".into(),
+            Value::from(1990 + edid[17] as u64),
+        );
+    }
+    display.insert(
+        "edid_version".into(),
+        Value::String(format!("{}.{}", edid[18], edid[19])),
+    );
+    // The four 18-byte descriptors at 54 hold the monitor name (0xFC) and the
+    // preferred timing, whose resolution is split across nibbles.
+    for block in edid[54..126].chunks(18) {
+        if block[0..3] == [0, 0, 0] && block[3] == 0xFC {
+            let name = String::from_utf8_lossy(&block[5..18])
+                .trim_end_matches(['\n', ' '])
+                .trim()
+                .to_owned();
+            if !name.is_empty() && !name.contains('\0') {
+                display.insert("name".into(), Value::String(name));
+            }
+        } else if block[0..2] != [0, 0] && !display.contains_key("xres") {
+            let xres = block[2] as u64 | (((block[4] as u64) & 0xf0) << 4);
+            let yres = block[5] as u64 | (((block[7] as u64) & 0xf0) << 4);
+            // The refresh rate is not stored; it is the pixel clock over the
+            // total blanked frame, which is what a guest computes when it
+            // reports a mode.
+            let clock = u16::from_le_bytes([block[0], block[1]]) as u64 * 10_000;
+            let htotal = xres + (block[3] as u64 | (((block[4] as u64) & 0x0f) << 8));
+            let vtotal = yres + (block[6] as u64 | (((block[7] as u64) & 0x0f) << 8));
+            if xres > 0 && yres > 0 {
+                display.insert("xres".into(), Value::from(xres));
+                display.insert("yres".into(), Value::from(yres));
+                if htotal > 0 && vtotal > 0 && clock > 0 {
+                    let rate = (clock + htotal * vtotal / 2) / (htotal * vtotal);
+                    display.insert("refresh_rate".into(), Value::from(rate));
+                }
+            }
         }
+    }
+    // Bytes 21 and 22 are the screen size in whole centimetres.
+    let (width_mm, height_mm) = (edid[21] as u64 * 10, edid[22] as u64 * 10);
+    if width_mm > 0 && height_mm > 0 {
+        display.insert("width_mm".into(), Value::from(width_mm));
+        display.insert("height_mm".into(), Value::from(height_mm));
+    }
+    Some(display)
+}
+
+fn host_displays(root: &Path) -> Vec<Value> {
+    let mut displays = Vec::new();
+    for connector in sorted_dir(&root.join("sys/class/drm")) {
+        let Ok(edid) = fs::read(connector.join("edid")) else {
+            continue;
+        };
+        let Some(mut display) = parse_edid(&edid) else {
+            continue;
+        };
+        display.insert("connector".into(), Value::String(file_name(&connector)));
+        display.insert(
+            "status".into(),
+            Value::String(host_string(&connector.join("status")).unwrap_or_default()),
+        );
+        displays.push(Value::Object(display));
+    }
+    displays
+}
+
+fn host_block_devices(root: &Path) -> Vec<Value> {
+    let mut devices = Vec::new();
+    for path in sorted_dir(&root.join("sys/block")) {
+        let name = file_name(&path);
+        // Virtual devices describe the host's storage stack, not its hardware.
+        if ["loop", "ram", "zram", "dm-", "md"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let device = path.join("device");
+        let mut item = serde_json::Map::new();
+        item.insert("name".into(), Value::String(name.clone()));
+        item.insert(
+            "kind".into(),
+            Value::String(
+                if name.starts_with("sr") {
+                    "optical"
+                } else {
+                    "disk"
+                }
+                .into(),
+            ),
+        );
+        insert_string(&mut item, "vendor", host_string(&device.join("vendor")));
+        insert_string(&mut item, "model", host_string(&device.join("model")));
+        insert_string(&mut item, "revision", host_string(&device.join("rev")));
+        // Sysfs reports capacity in 512-byte sectors regardless of the
+        // device's own block size.
+        if let Some(sectors) = number(&path.join("size")) {
+            item.insert("size_bytes".into(), Value::from(sectors * 512));
+        }
+        if let Some(removable) = number(&path.join("removable")) {
+            item.insert("removable".into(), Value::from(removable == 1));
+        }
+        if let Some(rotational) = number(&path.join("queue/rotational")) {
+            item.insert("rotational".into(), Value::from(rotational == 1));
+        }
+        devices.push(Value::Object(item));
+    }
+    devices
+}
+
+fn host_pci_devices(root: &Path) -> Vec<Value> {
+    let mut devices = Vec::new();
+    for path in sorted_dir(&root.join("sys/bus/pci/devices")) {
+        let mut item = serde_json::Map::new();
+        item.insert("slot".into(), Value::String(file_name(&path)));
+        for (key, file) in [
+            ("vendor_id", "vendor"),
+            ("device_id", "device"),
+            ("subsystem_vendor_id", "subsystem_vendor"),
+            ("subsystem_id", "subsystem_device"),
+            ("class", "class"),
+        ] {
+            if let Some(value) = hex_id(&path.join(file)) {
+                item.insert(key.into(), Value::from(value));
+            }
+        }
+        if let Ok(driver) = fs::read_link(path.join("driver")) {
+            item.insert("driver".into(), Value::String(file_name(&driver)));
+        }
+        devices.push(Value::Object(item));
+    }
+    devices
+}
+
+fn host_usb_devices(root: &Path) -> Vec<Value> {
+    let mut devices = Vec::new();
+    for path in sorted_dir(&root.join("sys/bus/usb/devices")) {
+        // Interfaces appear beside devices in this directory; only devices
+        // carry an idVendor.
+        let Some(vendor) = hex_id(&path.join("idVendor")) else {
+            continue;
+        };
+        let mut item = serde_json::Map::new();
+        item.insert("path".into(), Value::String(file_name(&path)));
+        item.insert("vendor_id".into(), Value::from(vendor));
+        if let Some(product) = hex_id(&path.join("idProduct")) {
+            item.insert("product_id".into(), Value::from(product));
+        }
+        if let Some(bcd) = hex_id(&path.join("bcdDevice")) {
+            item.insert("bcd_device".into(), Value::from(bcd));
+        }
+        insert_string(
+            &mut item,
+            "manufacturer",
+            host_string(&path.join("manufacturer")),
+        );
+        insert_string(&mut item, "product", host_string(&path.join("product")));
+        devices.push(Value::Object(item));
+    }
+    devices
+}
+
+/// Network interfaces, by model rather than by address.
+///
+/// The MAC is the one value here that identifies this machine, so it is left
+/// out; the guest's MAC is derived from the seed.
+fn host_network_devices(root: &Path) -> Vec<Value> {
+    let mut devices = Vec::new();
+    for path in sorted_dir(&root.join("sys/class/net")) {
+        let name = file_name(&path);
+        // A host that runs containers has dozens of veth and bridge
+        // interfaces. Only an interface backed by a real device has a
+        // `device` link, and only those describe the hardware.
+        if name == "lo" || !path.join("device").exists() {
+            continue;
+        }
+        let mut item = serde_json::Map::new();
+        item.insert("name".into(), Value::String(name));
+        for (key, file) in [
+            ("vendor_id", "device/vendor"),
+            ("device_id", "device/device"),
+        ] {
+            if let Some(value) = hex_id(&path.join(file)) {
+                item.insert(key.into(), Value::from(value));
+            }
+        }
+        if let Ok(driver) = fs::read_link(path.join("device/driver")) {
+            item.insert("driver".into(), Value::String(file_name(&driver)));
+        }
+        insert_string(&mut item, "operstate", host_string(&path.join("operstate")));
+        if let Some(speed) = host_string(&path.join("speed")).and_then(|v| v.parse::<i64>().ok())
+            && speed > 0
+        {
+            item.insert("speed_mbps".into(), Value::from(speed));
+        }
+        devices.push(Value::Object(item));
+    }
+    devices
+}
+
+fn host_thermal_zones(root: &Path) -> Vec<Value> {
+    let mut zones = Vec::new();
+    for path in sorted_dir(&root.join("sys/class/thermal")) {
+        if !file_name(&path).starts_with("thermal_zone") {
+            continue;
+        }
+        let millidegrees = |path: PathBuf| -> Option<i64> {
+            host_string(&path)?
+                .parse::<i64>()
+                .ok()
+                .map(|value| value / 1000)
+        };
+        let mut item = serde_json::Map::new();
+        item.insert("zone".into(), Value::String(file_name(&path)));
+        insert_string(&mut item, "type", host_string(&path.join("type")));
+        if let Some(temperature) = millidegrees(path.join("temp")) {
+            item.insert("temperature_celsius".into(), Value::from(temperature));
+        }
+        for index in 0..16 {
+            let Some(kind) = host_string(&path.join(format!("trip_point_{index}_type"))) else {
+                continue;
+            };
+            let key = match kind.as_str() {
+                "passive" => "passive_celsius",
+                "critical" => "critical_celsius",
+                _ => continue,
+            };
+            // A disabled trip point reads back as -274000, below absolute
+            // zero; a guest would read that as a machine with no cooling
+            // policy at all.
+            if !item.contains_key(key)
+                && let Some(value) = millidegrees(path.join(format!("trip_point_{index}_temp")))
+                && (1..=200).contains(&value)
+            {
+                item.insert(key.into(), Value::from(value));
+            }
+        }
+        zones.push(Value::Object(item));
+    }
+    zones
+}
+
+fn host_fans(root: &Path) -> Vec<Value> {
+    let mut fans = Vec::new();
+    for monitor in sorted_dir(&root.join("sys/class/hwmon")) {
+        let chip = host_string(&monitor.join("name"));
+        for index in 1..16 {
+            let Some(rpm) = number(&monitor.join(format!("fan{index}_input"))) else {
+                continue;
+            };
+            let mut item = serde_json::Map::new();
+            item.insert("hwmon".into(), Value::String(file_name(&monitor)));
+            insert_string(&mut item, "chip", chip.clone());
+            insert_string(
+                &mut item,
+                "label",
+                host_string(&monitor.join(format!("fan{index}_label"))),
+            );
+            item.insert("rpm".into(), Value::from(rpm));
+            fans.push(Value::Object(item));
+        }
+    }
+    fans
+}
+
+/// Everything the host will tell us about its hardware.
+///
+/// The profile below picks one display, one disk and one subsystem ID out of
+/// this, because that is what a single emulated machine can carry. The full
+/// lists stay in the output so the choice can be revisited without going back
+/// to the machine -- and so a second look can tell "the host has one monitor"
+/// from "we only looked at the first one".
+fn host_inventory(root: &Path) -> serde_json::Map<String, Value> {
+    let mut inventory = serde_json::Map::new();
+    inventory.insert("displays".into(), Value::Array(host_displays(root)));
+    inventory.insert(
+        "block_devices".into(),
+        Value::Array(host_block_devices(root)),
+    );
+    inventory.insert("pci_devices".into(), Value::Array(host_pci_devices(root)));
+    inventory.insert("usb_devices".into(), Value::Array(host_usb_devices(root)));
+    inventory.insert(
+        "network_devices".into(),
+        Value::Array(host_network_devices(root)),
+    );
+    inventory.insert(
+        "thermal_zones".into(),
+        Value::Array(host_thermal_zones(root)),
+    );
+    inventory.insert("fans".into(), Value::Array(host_fans(root)));
+    inventory
+}
+
+fn field<'a>(item: &'a Value, key: &str) -> Option<&'a Value> {
+    item.get(key).filter(|value| !value.is_null())
+}
+
+/// QEMU's fallback subsystem IDs are a Red Hat/QEMU pair a guest can read off
+/// any device, so the profile replaces them with the host's. The host bridge
+/// is preferred: it is the device a real board is guaranteed to brand.
+fn pci_defaults(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let devices = inventory["pci_devices"].as_array().expect("array");
+    let usable = |device: &&Value| {
+        field(device, "subsystem_vendor_id").and_then(Value::as_u64) > Some(0)
+            && field(device, "subsystem_id").is_some()
+    };
+    let chosen = devices
+        .iter()
+        .find(|device| device["slot"] == "0000:00:00.0" && usable(device))
+        .or_else(|| devices.iter().find(usable));
+    let mut pci = serde_json::Map::new();
+    if let Some(device) = chosen {
+        pci.insert(
+            "subsystem_vendor_id".into(),
+            device["subsystem_vendor_id"].clone(),
+        );
+        pci.insert("subsystem_id".into(), device["subsystem_id"].clone());
+        pci.insert("source_slot".into(), device["slot"].clone());
     }
     pci
 }
 
-/// Storage and display strings the guest can read back from its own devices.
+/// The emulated machine gets one disk, one optical drive and one monitor.
 ///
-/// Disk serials are per-machine and stay derived from the seed; only the
-/// vendor/product strings are cloned. EDID is parsed for the monitor's vendor,
-/// name and physical size, which is what a guest compares against its reported
-/// display.
-fn host_device_descriptors(root: &Path, seed_hash: &str) -> serde_json::Map<String, Value> {
+/// The connected display is preferred over a stale EDID on an unplugged
+/// connector, and a fixed disk over removable media.
+fn device_descriptors(
+    inventory: &serde_json::Map<String, Value>,
+    seed_hash: &str,
+) -> serde_json::Map<String, Value> {
+    let blocks = inventory["block_devices"].as_array().expect("array");
     let mut storage = serde_json::Map::new();
-    let block = root.join("sys/block");
-    let mut names: Vec<PathBuf> = fs::read_dir(&block)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    names.sort();
-    for path in &names {
-        let device = path.join("device");
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        let vendor = host_string(&device.join("vendor"));
-        let model = host_string(&device.join("model"));
-        if name.starts_with("sr") {
-            insert_string(&mut storage, "optical_vendor", vendor);
-            insert_string(&mut storage, "optical_product", model);
-        } else if !storage.contains_key("disk_product")
-            && (name.starts_with("sd") || name.starts_with("nvme"))
-        {
-            // NVMe exposes no vendor string, only a model; leaving the vendor
-            // absent is better than inventing one the guest could contradict.
-            insert_string(&mut storage, "disk_vendor", vendor);
-            insert_string(&mut storage, "disk_product", model);
-        }
-    }
-    if storage.contains_key("disk_product") {
+    let disk = blocks
+        .iter()
+        .find(|device| device["kind"] == "disk" && device["removable"] != Value::Bool(true))
+        .or_else(|| blocks.iter().find(|device| device["kind"] == "disk"));
+    if let Some(disk) = disk {
+        insert_string(
+            &mut storage,
+            "disk_vendor",
+            field(disk, "vendor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        insert_string(
+            &mut storage,
+            "disk_product",
+            field(disk, "model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        storage.insert("source_device".into(), disk["name"].clone());
         storage.insert(
             "disk_serial_prefix".into(),
             Value::String(format!("AN-{}", seed_hash[..8].to_uppercase())),
         );
     }
+    if let Some(optical) = blocks.iter().find(|device| device["kind"] == "optical") {
+        insert_string(
+            &mut storage,
+            "optical_vendor",
+            field(optical, "vendor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        insert_string(
+            &mut storage,
+            "optical_product",
+            field(optical, "model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+    }
 
-    let mut display = serde_json::Map::new();
-    let drm = root.join("sys/class/drm");
-    let mut cards: Vec<PathBuf> = fs::read_dir(&drm)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    cards.sort();
-    for card in cards {
-        let Ok(edid) = fs::read(card.join("edid")) else {
-            continue;
-        };
-        if edid.len() < 128 {
-            continue;
+    let displays = inventory["displays"].as_array().expect("array");
+    let mut display = displays
+        .iter()
+        .find(|display| display["status"] == "connected")
+        .or_else(|| displays.first())
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if !display.is_empty() {
+        display.remove("status");
+        if let Some(connector) = display.remove("connector") {
+            display.insert("source_connector".into(), connector);
         }
-        // EDID packs the manufacturer as three 5-bit letters, big-endian, in
-        // bytes 8-9; 'A' is 1.
-        let packed = u16::from_be_bytes([edid[8], edid[9]]);
-        let vendor: String = (0..3)
-            .map(|index| (b'A' - 1 + ((packed >> (10 - index * 5)) & 0x1f) as u8) as char)
-            .collect();
-        if !vendor
-            .chars()
-            .all(|character| character.is_ascii_uppercase())
-        {
-            continue;
-        }
-        display.insert("vendor".into(), Value::String(vendor));
-        // The four 18-byte descriptors at 54 hold the monitor name (0xFC) and
-        // the preferred timing, whose resolution is split across nibbles.
-        for block in edid[54..126].chunks(18) {
-            if block[0..3] == [0, 0, 0] && block[3] == 0xFC {
-                let name = String::from_utf8_lossy(&block[5..18])
-                    .trim_end_matches(['\n', ' '])
-                    .trim()
-                    .to_owned();
-                if !name.is_empty() && !name.contains('\0') {
-                    display.insert("name".into(), Value::String(name));
-                }
-            } else if block[0..2] != [0, 0] {
-                let xres = block[2] as u64 | (((block[4] as u64) & 0xf0) << 4);
-                let yres = block[5] as u64 | (((block[7] as u64) & 0xf0) << 4);
-                if xres > 0 && yres > 0 && !display.contains_key("xres") {
-                    display.insert("xres".into(), Value::from(xres));
-                    display.insert("yres".into(), Value::from(yres));
-                }
-            }
-        }
-        let (width_mm, height_mm) = (edid[21] as u64 * 10, edid[22] as u64 * 10);
-        if width_mm > 0 && height_mm > 0 {
-            display.insert("width_mm".into(), Value::from(width_mm));
-            display.insert("height_mm".into(), Value::from(height_mm));
-        }
-        break;
+        // The monitor's own serial, like the machine's, stays derived: the
+        // number in the EDID identifies the panel on the host's desk.
+        display.insert(
+            "serial".into(),
+            Value::String(format!("AN-{}", seed_hash[8..16].to_uppercase())),
+        );
     }
 
     let mut descriptors = serde_json::Map::new();
@@ -670,53 +998,41 @@ fn host_device_descriptors(root: &Path, seed_hash: &str) -> serde_json::Map<Stri
     descriptors
 }
 
-/// Thermal and fan readings, which a guest uses to tell a machine with a
-/// cooling system from one without.
-fn host_sensors(root: &Path) -> serde_json::Map<String, Value> {
-    let mut sensors = serde_json::Map::new();
-    let zone = root.join("sys/class/thermal/thermal_zone0");
-    let millidegrees = |path: PathBuf| -> Option<i64> {
-        host_string(&path)?
-            .parse::<i64>()
-            .ok()
-            .map(|value| value / 1000)
+/// thermal_zone0 is whatever the kernel registered first, which on a desktop
+/// board is often an INT3400 policy device idling at room temperature while
+/// the CPU package sits at 70C. A guest reading a CPU temperature that never
+/// moves has learned something, so prefer the package sensor.
+fn sensors(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let zones = inventory["thermal_zones"].as_array().expect("array");
+    let plausible = |zone: &&Value| {
+        field(zone, "temperature_celsius")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| (1..=150).contains(&value))
     };
-    if let Some(temperature) = millidegrees(zone.join("temp")) {
-        sensors.insert("temperature_celsius".into(), Value::from(temperature));
-    }
-    for index in 0..16 {
-        let Some(kind) = host_string(&zone.join(format!("trip_point_{index}_type"))) else {
-            continue;
-        };
-        let key = match kind.as_str() {
-            "passive" => "passive_celsius",
-            "critical" => "critical_celsius",
-            _ => continue,
-        };
-        if !sensors.contains_key(key)
-            && let Some(value) = millidegrees(zone.join(format!("trip_point_{index}_temp")))
-        {
-            sensors.insert(key.into(), Value::from(value));
-        }
-    }
-    let hwmon = root.join("sys/class/hwmon");
-    let mut monitors: Vec<PathBuf> = fs::read_dir(&hwmon)
+    let chosen = ["x86_pkg_temp", "acpitz"]
         .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    monitors.sort();
-    'outer: for monitor in monitors {
-        for index in 1..8 {
-            if let Some(rpm) = host_string(&monitor.join(format!("fan{index}_input")))
-                .and_then(|value| value.parse::<u64>().ok())
-                && rpm > 0
-            {
-                sensors.insert("fan_rpm".into(), Value::from(rpm));
-                break 'outer;
+        .find_map(|kind| {
+            zones
+                .iter()
+                .find(|zone| zone["type"] == kind && plausible(zone))
+        })
+        .or_else(|| zones.iter().find(plausible));
+    let mut sensors = serde_json::Map::new();
+    if let Some(zone) = chosen {
+        for key in ["temperature_celsius", "passive_celsius", "critical_celsius"] {
+            if let Some(value) = field(zone, key) {
+                sensors.insert(key.into(), value.clone());
             }
         }
+        sensors.insert("source_zone".into(), zone["zone"].clone());
+    }
+    if let Some(fan) = inventory["fans"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|fan| fan["rpm"].as_u64() > Some(0))
+    {
+        sensors.insert("fan_rpm".into(), fan["rpm"].clone());
     }
     sensors
 }
@@ -737,15 +1053,16 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
     analysis.insert("enabled".into(), Value::Bool(true));
     analysis.insert("profile".into(), Value::String("malware-analysis".into()));
     analysis.insert("identity_seed".into(), Value::String(seed.to_owned()));
+    let inventory = host_inventory(root);
     for (key, value) in [
         ("smbios", host_smbios(root)),
         ("acpi", host_acpi(root)),
-        ("pci", host_pci(root)),
+        ("pci", pci_defaults(&inventory)),
         (
             "device_descriptors",
-            host_device_descriptors(root, &seed_hash),
+            device_descriptors(&inventory, &seed_hash),
         ),
-        ("sensors", host_sensors(root)),
+        ("sensors", sensors(&inventory)),
     ] {
         analysis.insert(key.into(), Value::Object(value));
     }
@@ -790,6 +1107,9 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
         })
         .map(|key| Value::String(key.into()))
         .collect();
+    // Everything the host reported, so the choices above can be revisited
+    // without going back to the machine.
+    profile.insert("inventory".into(), Value::Object(inventory));
     profile.insert(
         "source".into(),
         serde_json::json!({
@@ -912,10 +1232,84 @@ mod tests {
         let mut dsdt = vec![0u8; 36];
         dsdt[0..4].copy_from_slice(b"DSDT");
         dsdt[10..16].copy_from_slice(b"LENOVO");
-        dsdt[16..24].copy_from_slice(b"TP-N32  ");
+        // AMI pads this field with NULs rather than spaces.
+        dsdt[16..24].copy_from_slice(b"TP-N32\0\0");
         dsdt[24..28].copy_from_slice(&1u32.to_le_bytes());
         dsdt[28..32].copy_from_slice(b"ACPI");
         std::fs::write(tables.join("DSDT"), &dsdt).unwrap();
+        // A monitor's EDID: fixed header, "DEL" packed as three 5-bit
+        // letters, a 1920x1080@60 preferred timing, a name descriptor, and a
+        // serial descriptor that must not be copied.
+        let connector = root.join("sys/class/drm/card0-DP-1");
+        std::fs::create_dir_all(&connector).unwrap();
+        std::fs::write(connector.join("status"), "connected\n").unwrap();
+        let mut edid = vec![0u8; 128];
+        edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        edid[8..10].copy_from_slice(&0x10ACu16.to_be_bytes());
+        edid[10..12].copy_from_slice(&0xD12Du16.to_le_bytes());
+        edid[16] = 18;
+        edid[17] = 32; // 2022
+        edid[18] = 1;
+        edid[19] = 4;
+        edid[21] = 80;
+        edid[22] = 33;
+        let timing = &mut edid[54..72];
+        timing[0..2].copy_from_slice(&14850u16.to_le_bytes());
+        timing[2] = (1920u16 & 0xff) as u8;
+        timing[3] = (280u16 & 0xff) as u8;
+        timing[4] = 0x71;
+        timing[5] = (1080u16 & 0xff) as u8;
+        timing[6] = 45;
+        timing[7] = 0x40;
+        edid[72..76].copy_from_slice(&[0, 0, 0, 0xFC]);
+        edid[77..90].copy_from_slice(b"DELL S3422DWG");
+        edid[90..94].copy_from_slice(&[0, 0, 0, 0xFF]);
+        edid[95..102].copy_from_slice(b"2Y4XS63");
+        std::fs::write(connector.join("edid"), &edid).unwrap();
+        // A second monitor, unplugged but still cached by the driver, sorting
+        // ahead of the connected one.
+        let stale = root.join("sys/class/drm/card0-DP-0");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("status"), "disconnected\n").unwrap();
+        let mut second = edid.clone();
+        second[8..10].copy_from_slice(&0x0472u16.to_be_bytes()); // ACR
+        std::fs::write(stale.join("edid"), &second).unwrap();
+
+        // Two fixed disks, a USB stick and an optical drive.
+        for (name, model, removable) in [
+            ("sda", "Samsung SSD 990 PRO 4TB", "0"),
+            ("sdb", "CT4000P3PSSD8", "0"),
+            ("sdc", "Cruzer Blade", "1"),
+            ("sr0", "DVD-ROM SH-116", "1"),
+        ] {
+            let device = root.join("sys/block").join(name).join("device");
+            std::fs::create_dir_all(&device).unwrap();
+            std::fs::write(device.join("model"), model).unwrap();
+            std::fs::write(device.join("vendor"), "ATA").unwrap();
+            std::fs::write(device.parent().unwrap().join("removable"), removable).unwrap();
+            std::fs::write(device.parent().unwrap().join("size"), "7814037168").unwrap();
+        }
+        // Virtual devices are not hardware and must not be listed.
+        std::fs::create_dir_all(root.join("sys/block/loop0")).unwrap();
+
+        // thermal_zone0 is a policy device idling at room temperature; the
+        // package sensor is the one a guest would recognize.
+        for (zone, kind, temp) in [
+            ("thermal_zone0", "INT3400", 20000),
+            ("thermal_zone1", "x86_pkg_temp", 71000),
+        ] {
+            let path = root.join("sys/class/thermal").join(zone);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("type"), kind).unwrap();
+            std::fs::write(path.join("temp"), temp.to_string()).unwrap();
+        }
+        let package = root.join("sys/class/thermal/thermal_zone1");
+        std::fs::write(package.join("trip_point_0_type"), "critical").unwrap();
+        std::fs::write(package.join("trip_point_0_temp"), "100000").unwrap();
+        std::fs::write(package.join("trip_point_1_type"), "passive").unwrap();
+        // A disabled trip point, which must not reach the profile.
+        std::fs::write(package.join("trip_point_1_temp"), "-274000").unwrap();
+
         let device = root.join("sys/bus/pci/devices/0000:00:00.0");
         std::fs::create_dir_all(&device).unwrap();
         std::fs::write(device.join("subsystem_vendor"), "0x17aa\n").unwrap();
@@ -929,12 +1323,43 @@ mod tests {
         assert_eq!(analysis["acpi"]["oem_id"], "LENOVO");
         assert_eq!(analysis["acpi"]["oem_table_id"], "TP-N32");
         assert_eq!(analysis["acpi"]["creator_id"], "ACPI");
+        assert_eq!(analysis["acpi"]["oem_table_id"], "TP-N32");
         assert_eq!(analysis["pci"]["subsystem_vendor_id"], 0x17aa);
+        // Everything the host reported is kept, and the profile picks from it:
+        // the connected monitor, and a fixed disk over removable media.
+        let inventory = &profile["inventory"];
+        assert_eq!(inventory["displays"].as_array().unwrap().len(), 2);
+        assert_eq!(inventory["block_devices"].as_array().unwrap().len(), 4);
+        assert_eq!(inventory["pci_devices"].as_array().unwrap().len(), 1);
+        assert_eq!(inventory["thermal_zones"].as_array().unwrap().len(), 2);
+        let storage = &analysis["device_descriptors"]["storage"];
+        assert_eq!(storage["disk_product"], "Samsung SSD 990 PRO 4TB");
+        assert_eq!(storage["source_device"], "sda");
+        assert_eq!(storage["optical_product"], "DVD-ROM SH-116");
+        let display = &analysis["device_descriptors"]["display"];
+        assert_eq!(display["source_connector"], "card0-DP-1");
+        assert_eq!(display["vendor"], "DEL");
+        assert_eq!(display["product_id"], 0xD12D);
+        assert_eq!(display["manufacture_week"], 18);
+        assert_eq!(display["manufacture_year"], 2022);
+        assert_eq!(display["edid_version"], "1.4");
+        assert_eq!(display["name"], "DELL S3422DWG");
+        assert_eq!(display["xres"], 1920);
+        assert_eq!(display["yres"], 1080);
+        assert_eq!(display["refresh_rate"], 60);
+        assert_eq!(display["width_mm"], 800);
+        assert_eq!(display["height_mm"], 330);
+        let sensors = &analysis["sensors"];
+        assert_eq!(sensors["temperature_celsius"], 71);
+        assert_eq!(sensors["critical_celsius"], 100);
+        assert!(sensors.get("passive_celsius").is_none());
         assert_eq!(profile["vcpu"], 2);
         // The host's serial and UUID must not reach the profile in any form.
         let text = serde_json::to_string(&profile).unwrap();
         assert!(!text.contains("PF2ABCDE"));
         assert!(!text.contains("3f2504e0"));
+        // Nor may the monitor's own serial, from the 0xFF descriptor.
+        assert!(!text.contains("2Y4XS63"));
 
         // The clone is an ordinary profile input: it validates, and the
         // identity it resolves to is the seed's, not the host's.

@@ -94,6 +94,17 @@ the host, and any malware that phones home would report the host's real
 identifiers. The output is an ordinary profile input, so `validate` accepts it
 directly.
 
+The output carries two layers. `inventory` is everything the host reported:
+every display with its decoded EDID, every block device, PCI function, USB
+device, network interface, thermal zone and fan. `analysis` is the profile
+itself, which picks from that inventory what a single emulated machine can
+carry -- the connected monitor, a fixed disk over removable media, the host
+bridge's subsystem IDs, the CPU package thermal zone -- and records which one
+it took in `source_device`, `source_connector`, `source_slot` and
+`source_zone`. Keeping both means the choice can be revisited without going
+back to the machine, and that a second look can tell a host with one monitor
+from a capture that only looked at the first.
+
 Every source is optional and the command never fails on a missing one; the
 `source.unavailable` list names the sections that came back empty. ACPI tables
 are root-readable only on most distributions, so an unprivileged run reports
