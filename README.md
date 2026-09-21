@@ -81,6 +81,27 @@ python3 scripts/validate_engine_bundle.py .cache/qemu-build-10.2.4/engine-build.
 Validation rejects incomplete or dirty manifests, path escapes, missing
 executables, symlinks, and executable digest mismatches.
 
+## Tasks
+
+`Taskfile.yml` wraps the same scripts for [go-task](https://taskfile.dev), so
+the ordinary paths are one command and each already runs inside the right
+development shell. `task` alone lists everything.
+
+```sh
+task release            # fetch, build and validate the board track
+task release:analysis   # the same for the analysis track
+task kernel:build       # analysis KVM guard module, against .#kernel
+task check              # track inputs, clippy, workspace tests, tooling tests
+```
+
+`task build` passes arguments after `--` to the build script, so a
+reconfigure is `task build -- --reconfigure`, or simply `task reconfigure`.
+`KERNEL_SHELL` selects the kernel the
+module builds against; `task kernel:build:stable` and
+`task kernel:build:analysis` are the pinned stable and patched-stable shells.
+Set `MACHINEEMU_NO_NIX=1` to drop the `nix develop` wrapper when the shell is
+already entered.
+
 ## Independent checkout
 
 An engine build must be reproducible from this checkout and its declared inputs.
@@ -94,6 +115,7 @@ Initial directories:
 - `crates`: board models and QEMU helper crates
 - `kernel`: optional analysis host-kernel components
 - `scripts`, `tests`: build and verification tooling
+- `Taskfile.yml`: task entry points over those scripts
 - `flake.nix`, `nix`: pinned build environment
 
 The first commit is a repository boundary only. The source tree is ported after

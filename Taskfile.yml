@@ -1,0 +1,178 @@
+version: '3'
+
+# Every build runs inside the pinned Nix development shell, because QEMU's
+# configure detects libraries silently: a dependency missing from the host
+# drops the device that needs it instead of failing the build. Set
+# MACHINEEMU_NO_NIX=1 to run the commands directly when the shell is already
+# entered.
+
+vars:
+  BUILD_DIR: '{{.BUILD_DIR | default ".cache/qemu-build-10.2.4"}}'
+  ANALYSIS_BUILD_DIR: '{{.ANALYSIS_BUILD_DIR | default ".cache/qemu-build-10.2.4-analysis"}}'
+  # .#kernel (unstable), .#kernel-stable, or .#kernel-analysis-stable.
+  KERNEL_SHELL: '{{.KERNEL_SHELL | default ".#kernel"}}'
+
+tasks:
+  default:
+    desc: List the available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  dev:
+    internal: true
+    cmds:
+      - '{{if eq (env "MACHINEEMU_NO_NIX") "1"}}{{else}}nix develop {{.SHELL}} --command {{end}}{{.CMD}}'
+
+  # --- engine -------------------------------------------------------------
+
+  fetch:
+    desc: Fetch QEMU 10.2.4 and apply the unifi-10.2 series
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'scripts/fetch-unifi-10.2.sh'}
+
+  build:
+    desc: Build the board track (qemu-system-aarch64)
+    deps: [fetch]
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'scripts/build-unifi-10.2.sh {{.CLI_ARGS}}'}
+
+  build:analysis:
+    desc: Build the analysis track (qemu-system-x86_64) into its own source and build dir
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'scripts/build-analysis-10.2.sh {{.CLI_ARGS}}'}
+
+  reconfigure:
+    desc: Rebuild the board track after switching tracks in a shared build dir
+    cmds:
+      - task: build
+        vars: {CLI_ARGS: '--reconfigure'}
+
+  validate:
+    desc: Validate the board track engine bundle
+    cmds:
+      - task: dev
+        vars:
+          SHELL: '.#qemu'
+          CMD: 'python3 scripts/validate_engine_bundle.py {{.BUILD_DIR}}/engine-build.json'
+
+  validate:analysis:
+    desc: Validate the analysis track engine bundle
+    cmds:
+      - task: dev
+        vars:
+          SHELL: '.#qemu'
+          CMD: 'python3 scripts/validate_engine_bundle.py {{.ANALYSIS_BUILD_DIR}}/engine-build.json'
+
+  release:
+    desc: Build and validate the board track bundle
+    cmds:
+      - task: build
+      - task: validate
+
+  release:analysis:
+    desc: Build and validate the analysis track bundle
+    cmds:
+      - task: build:analysis
+      - task: validate:analysis
+
+  release:all:
+    desc: Build and validate both engine tracks
+    cmds:
+      - task: release
+      - task: release:analysis
+
+  # --- kernel -------------------------------------------------------------
+
+  kernel:check:
+    desc: Check the kernel build tree the module would compile against
+    cmds:
+      - task: dev
+        vars:
+          SHELL: '{{.KERNEL_SHELL}}'
+          # The dev shell exports KDIR; make keeps an environment KDIR over its
+          # own `?=` default, so naming it here would only expand outside the shell.
+          CMD: 'make -C kernel/analysis-kvm check'
+
+  kernel:build:
+    desc: Build the analysis KVM guard module (KERNEL_SHELL selects the kernel)
+    cmds:
+      - task: dev
+        vars: {SHELL: '{{.KERNEL_SHELL}}', CMD: 'scripts/build-analysis-kvm-module.sh'}
+
+  kernel:build:stable:
+    desc: Build the module against the pinned stable kernel
+    cmds:
+      - task: kernel:build
+        vars: {KERNEL_SHELL: '.#kernel-stable'}
+
+  kernel:build:analysis:
+    desc: Build the module against the stable kernel with the analysis RDTSC VMX patch
+    cmds:
+      - task: kernel:build
+        vars: {KERNEL_SHELL: '.#kernel-analysis-stable'}
+
+  kernel:clean:
+    desc: Remove the kernel module build outputs
+    cmds:
+      - task: dev
+        vars:
+          SHELL: '{{.KERNEL_SHELL}}'
+          CMD: 'make -C kernel/analysis-kvm clean'
+
+  # --- crates and checks --------------------------------------------------
+
+  rust:build:
+    desc: Build the FFI static libraries the QEMU builds link
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'cargo build -p board-ffi -p analysis-profile --release'}
+
+  rust:test:
+    desc: Run the workspace tests
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'cargo test --workspace {{.CLI_ARGS}}'}
+
+  rust:fmt:
+    desc: Format the workspace
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'cargo fmt --all'}
+
+  rust:clippy:
+    desc: Lint the workspace
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'cargo clippy --workspace --all-targets -- -D warnings'}
+
+  check:tracks:
+    desc: Check that both tracks' patch and integration inputs are present
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'python3 scripts/check_track.py tracks/unifi-10.2'}
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'python3 scripts/check_track.py tracks/analysis-10.2'}
+
+  test:
+    desc: Run the tooling tests
+    cmds:
+      - task: dev
+        vars: {SHELL: '.#qemu', CMD: 'python3 -m pytest tests {{.CLI_ARGS}}'}
+
+  check:
+    desc: Track inputs, workspace lint and tests, tooling tests
+    cmds:
+      - task: check:tracks
+      - task: rust:clippy
+      - task: rust:test
+      - task: test
+
+  clean:
+    desc: Remove the Cargo target dir and the module build outputs
+    cmds:
+      - cargo clean
+      - task: kernel:clean
