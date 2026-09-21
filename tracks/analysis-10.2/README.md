@@ -112,6 +112,17 @@ machine. That guest is an exact twin, which also means it collides with the
 host on the same network and reports the host's real identifiers if it phones
 home, so nothing produces it by default.
 
+From the raw SMBIOS table the inventory also keeps the structures no profile
+field covers yet: the cache topology, the board's slots and onboard devices by
+bus address, the port connectors, the TPM's vendor and firmware revision, and
+the memory array's capacity and slot count. None of it is applied to the
+emulated machine today. It is captured because deciding what a convincing
+guest needs is easier against a real machine's table than from memory, and
+because re-taking a capture means going back to the host. Enumerated fields
+are recorded as their SMBIOS codes rather than as names: those enumerations
+grow with every socket and connector, and a guessed mapping would state the
+wrong hardware with confidence.
+
 The inventory lists every ACPI table the firmware published, and reports the
 two Windows OEM licensing tables by name. A machine that shipped with Windows 8
 or later carries its product key in the ACPI `MSDM` table, 29 characters at
