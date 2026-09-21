@@ -112,6 +112,21 @@ machine. That guest is an exact twin, which also means it collides with the
 host on the same network and reports the host's real identifiers if it phones
 home, so nothing produces it by default.
 
+The inventory lists every ACPI table the firmware published, and reports the
+two Windows OEM licensing tables by name. A machine that shipped with Windows 8
+or later carries its product key in the ACPI `MSDM` table, 29 characters at
+offset 56; Windows 7 and earlier used `SLIC`, which holds an OEM public key and
+a signed marker instead. Neither table exists on a retail board or in a stock
+QEMU guest, so their absence is one more thing a guest can check. Presence and
+readability are reported separately: the table directory is world-readable
+while the tables are not, and an unreadable `MSDM` is not the same as a machine
+that never shipped with Windows.
+
+The OEM key travels with a literal clone and not with a seeded one. It is bound
+to the physical machine in the same way its serials are, and a derived key
+would be 29 characters that fail Windows' own format check, which is worse than
+no key at all.
+
 The inventory always records what was observed, including the serials the
 seeded profile does not use. Either mode's output is an ordinary profile
 input, so `validate` accepts it directly.

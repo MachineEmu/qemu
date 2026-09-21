@@ -1087,6 +1087,120 @@ fn host_thermal_zones(root: &Path) -> Vec<Value> {
     zones
 }
 
+/// The Windows OEM licensing tables, and the key one of them carries.
+///
+/// A machine that shipped with Windows 8 or later has its product key burned
+/// into firmware in the ACPI MSDM table: 36 bytes of ACPI header, then the
+/// SLS version, reserved, data type and data reserved words, then a length and
+/// the key itself at offset 56. Windows 7 and earlier used SLIC instead, which
+/// carries an OEM public key and a signed marker rather than a key.
+///
+/// Neither table exists on a retail board or in a stock VM, so their absence
+/// is itself something a guest can notice.
+fn host_licensing(root: &Path) -> serde_json::Map<String, Value> {
+    let tables = root.join("sys/firmware/acpi/tables");
+    let mut licensing = serde_json::Map::new();
+
+    let header = |data: &[u8], item: &mut serde_json::Map<String, Value>| {
+        item.insert("length".into(), Value::from(data.len()));
+        let text = |range: std::ops::Range<usize>| {
+            let value = String::from_utf8_lossy(&data[range])
+                .trim_matches(|character: char| character == '\0' || character.is_whitespace())
+                .to_owned();
+            (!value.is_empty() && !value.contains('\0')).then_some(value)
+        };
+        insert_string(item, "oem_id", text(10..16));
+        insert_string(item, "oem_table_id", text(16..24));
+    };
+
+    // The table directory is world-readable while the tables themselves are
+    // not, so presence and readability are two different questions: reporting
+    // an unreadable MSDM as absent would say this machine never shipped with
+    // Windows.
+    let mut msdm = serde_json::Map::new();
+    msdm.insert("present".into(), Value::Bool(tables.join("MSDM").exists()));
+    match fs::read(tables.join("MSDM")) {
+        Ok(data) if data.len() >= 85 => {
+            msdm.insert("present".into(), Value::Bool(true));
+            header(&data, &mut msdm);
+            // The length word at 52 covers the key that follows; OA 3.0 keys
+            // are always 29 characters, and anything else is not one.
+            let length = u32::from_le_bytes(data[52..56].try_into().expect("fixed width")) as usize;
+            let key = String::from_utf8_lossy(&data[56..(56 + length).min(data.len())]).to_string();
+            let valid = length == 29
+                && key.len() == 29
+                && key.chars().all(|character| {
+                    character.is_ascii_uppercase() || character.is_ascii_digit() || character == '-'
+                });
+            msdm.insert("key_present".into(), Value::Bool(valid));
+            if valid {
+                msdm.insert("key".into(), Value::String(key));
+            }
+        }
+        _ if msdm["present"] == Value::Bool(true) => {
+            msdm.insert("readable".into(), Value::Bool(false));
+        }
+        _ => {}
+    }
+    licensing.insert("msdm".into(), Value::Object(msdm));
+
+    let mut slic = serde_json::Map::new();
+    slic.insert("present".into(), Value::Bool(tables.join("SLIC").exists()));
+    match fs::read(tables.join("SLIC")) {
+        Ok(data) if data.len() >= 36 => {
+            slic.insert("present".into(), Value::Bool(true));
+            header(&data, &mut slic);
+            // The public key structure is 156 bytes, so the marker that names
+            // the licensed OEM starts at 192 and carries its own OEM strings.
+            if data.len() >= 218 {
+                let text = |range: std::ops::Range<usize>| {
+                    let value = String::from_utf8_lossy(&data[range])
+                        .trim_matches(|character: char| {
+                            character == '\0' || character.is_whitespace()
+                        })
+                        .to_owned();
+                    (!value.is_empty() && !value.contains('\0')).then_some(value)
+                };
+                insert_string(&mut slic, "marker_oem_id", text(204..210));
+                insert_string(&mut slic, "marker_oem_table_id", text(210..218));
+            }
+        }
+        _ if slic["present"] == Value::Bool(true) => {
+            slic.insert("readable".into(), Value::Bool(false));
+        }
+        _ => {}
+    }
+    licensing.insert("slic".into(), Value::Object(slic));
+    licensing
+}
+
+/// The signatures of every ACPI table the firmware published.
+///
+/// Which tables exist is as much a fingerprint as what they contain: a stock
+/// QEMU guest publishes a short, recognizable set, and a physical machine
+/// publishes a long one with vendor tables in it.
+fn host_acpi_tables(root: &Path) -> Vec<Value> {
+    let mut tables = Vec::new();
+    for base in [
+        root.join("sys/firmware/acpi/tables"),
+        root.join("sys/firmware/acpi/tables/dynamic"),
+    ] {
+        for path in sorted_dir(&base) {
+            if !path.is_file() {
+                continue;
+            }
+            let mut item = serde_json::Map::new();
+            item.insert("name".into(), Value::String(file_name(&path)));
+            if let Ok(data) = fs::read(&path) {
+                item.insert("length".into(), Value::from(data.len()));
+                item.insert("sha256".into(), Value::String(hex(&Sha256::digest(&data))));
+            }
+            tables.push(Value::Object(item));
+        }
+    }
+    tables
+}
+
 fn host_fans(root: &Path) -> Vec<Value> {
     let mut fans = Vec::new();
     for monitor in sorted_dir(&root.join("sys/class/hwmon")) {
@@ -1135,6 +1249,8 @@ fn host_inventory(root: &Path) -> serde_json::Map<String, Value> {
         Value::Array(host_thermal_zones(root)),
     );
     inventory.insert("fans".into(), Value::Array(host_fans(root)));
+    inventory.insert("acpi_tables".into(), Value::Array(host_acpi_tables(root)));
+    inventory.insert("licensing".into(), Value::Object(host_licensing(root)));
     inventory
 }
 
@@ -1464,6 +1580,16 @@ pub fn host_clone(root: &Path, seed: Option<&str>) -> Result<Value, ProfileError
         );
         analysis.insert("identity".into(), serde_json::to_value(&identity)?);
         analysis.insert("identity_source".into(), Value::String("host".into()));
+        // The OEM key is bound to this machine like its serials are, so it
+        // travels with a literal clone and not with a derived one: a derived
+        // key would be a 29-character string that fails Windows' own format
+        // check, which is worse than no key at all.
+        if let Some(key) = inventory["licensing"]["msdm"].get("key") {
+            analysis.insert(
+                "licensing".into(),
+                serde_json::json!({"windows_oem_key": key, "source": "msdm"}),
+            );
+        }
     }
 
     let mut profile = serde_json::Map::new();
@@ -1972,6 +2098,54 @@ mod tests {
         let validated = validate_json(&serde_json::to_string(&profile).unwrap()).unwrap();
         let validated: Value = serde_json::from_str(&validated).unwrap();
         assert_eq!(validated["identity"]["mac"], "3c:fd:fe:9c:5a:41");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_oem_licensing_tables_are_reported_and_the_key_read() {
+        let root = fixture_root("host-clone-msdm");
+        let tables = root.join("sys/firmware/acpi/tables");
+        std::fs::create_dir_all(&tables).unwrap();
+        // MSDM: ACPI header, the four SLS words, a length, and the key.
+        let key = "XXXXX-YYYYY-ZZZZZ-11111-22222";
+        let mut msdm = vec![0u8; 56];
+        msdm[0..4].copy_from_slice(b"MSDM");
+        msdm[10..16].copy_from_slice(b"ALASKA");
+        msdm[16..24].copy_from_slice(b"A M I\0\0\0");
+        msdm[52..56].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        msdm.extend_from_slice(key.as_bytes());
+        std::fs::write(tables.join("MSDM"), &msdm).unwrap();
+        // SLIC: header, the 156-byte public key structure, then the marker.
+        let mut slic = vec![0u8; 218];
+        slic[0..4].copy_from_slice(b"SLIC");
+        slic[10..16].copy_from_slice(b"LENOVO");
+        slic[204..210].copy_from_slice(b"LENOVO");
+        slic[210..218].copy_from_slice(b"TP-N32\0\0");
+        std::fs::write(tables.join("SLIC"), &slic).unwrap();
+
+        let licensing = &host_clone(&root, Some("seed")).unwrap()["inventory"]["licensing"];
+        assert_eq!(licensing["msdm"]["present"], true);
+        assert_eq!(licensing["msdm"]["oem_id"], "ALASKA");
+        assert_eq!(licensing["msdm"]["key_present"], true);
+        assert_eq!(licensing["msdm"]["key"], key);
+        assert_eq!(licensing["slic"]["present"], true);
+        assert_eq!(licensing["slic"]["marker_oem_id"], "LENOVO");
+        assert_eq!(licensing["slic"]["marker_oem_table_id"], "TP-N32");
+
+        // A seeded profile leaves the key out; a literal clone carries it,
+        // because a derived key would fail Windows' own format check.
+        let seeded = host_clone(&root, Some("seed")).unwrap();
+        assert!(seeded["analysis"].get("licensing").is_none());
+        let literal = host_clone(&root, None).unwrap();
+        assert_eq!(literal["analysis"]["licensing"]["windows_oem_key"], key);
+
+        // A machine that never shipped with Windows says so.
+        let bare = fixture_root("host-clone-no-msdm");
+        std::fs::create_dir_all(&bare).unwrap();
+        let licensing = &host_clone(&bare, Some("seed")).unwrap()["inventory"]["licensing"];
+        assert_eq!(licensing["msdm"]["present"], false);
+        assert_eq!(licensing["slic"]["present"], false);
+        std::fs::remove_dir_all(bare).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
