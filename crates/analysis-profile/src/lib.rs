@@ -552,6 +552,12 @@ impl DmiStructure {
                 "Default string",
                 "None",
                 "Unknown",
+                // AMI ships these as asset tags and serial numbers on boards
+                // whose vendor never set one.
+                "9876543210",
+                "0123456789",
+                "123456789",
+                "Default String",
             ]
             .contains(&value)
         {
@@ -2004,6 +2010,7 @@ mod tests {
                 (0x15, &3200u16.to_le_bytes()),
                 (0x17, &[3]),
                 (0x18, &[4]),
+                (0x19, &[6]),
                 (0x1A, &[5]),
                 (0x1C, &32768u32.to_le_bytes()),
                 (0x20, &3200u16.to_le_bytes()),
@@ -2015,6 +2022,8 @@ mod tests {
                 // The module's serial, which must not be copied.
                 "DEADBEEF01",
                 "CMK32GX4M2E3200C16",
+                // AMI's placeholder asset tag, not an asset tag.
+                "9876543210",
             ],
         ));
         table.extend(dmi_structure(17, 0x54, &[(0x10, &[1])], &["DIMM 1"]));
@@ -2031,6 +2040,7 @@ mod tests {
         assert_eq!(smbios["memory_manufacturer"], "Corsair");
         assert_eq!(smbios["memory_part"], "CMK32GX4M2E3200C16");
         assert_eq!(smbios["memory_speed"], 3200);
+        assert!(smbios.get("memory_asset").is_none());
         // "To Be Filled By O.E.M." is not an identity.
         assert!(smbios.get("processor_part").is_none());
 
