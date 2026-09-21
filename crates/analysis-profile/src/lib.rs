@@ -523,9 +523,6 @@ fn host_smbios(root: &Path) -> serde_json::Map<String, Value> {
     };
     insert_string(&mut smbios, "processor_manufacturer", field("vendor_id"));
     insert_string(&mut smbios, "processor_version", field("model name"));
-    if let Some(speed) = field("cpu MHz").and_then(|value| value.parse::<f64>().ok()) {
-        smbios.insert("processor_current_speed".into(), Value::from(speed as u64));
-    }
     smbios
 }
 
@@ -654,10 +651,18 @@ fn dmi_smbios(structures: &[DmiStructure]) -> serde_json::Map<String, Value> {
         insert_string(&mut smbios, "processor_part", processor.text(0x22));
         for (key, offset) in [
             ("processor_max_speed", 0x14),
+            // The firmware's own current speed. /proc/cpuinfo reports the
+            // clock at the instant it is read, which moves between runs and
+            // is not what a guest reads out of SMBIOS.
             ("processor_current_speed", 0x16),
         ] {
             if let Some(speed) = processor.word(offset).filter(|speed| *speed > 0) {
                 smbios.insert(key.into(), Value::from(speed));
+            }
+        }
+        for (key, offset) in [("processor_cores", 0x23), ("processor_threads", 0x25)] {
+            if let Some(count) = processor.data.get(offset).filter(|count| **count > 0) {
+                smbios.insert(key.into(), Value::from(*count));
             }
         }
     }
@@ -1982,8 +1987,10 @@ mod tests {
                 (7, &[2]),
                 (0x10, &[3]),
                 (0x14, &5400u16.to_le_bytes()),
-                (0x16, &3997u16.to_le_bytes()),
+                (0x16, &3366u16.to_le_bytes()),
                 (0x22, &[4]),
+                (0x23, &[16]),
+                (0x25, &[24]),
             ],
             &[
                 "LGA1700",
@@ -2036,7 +2043,10 @@ mod tests {
         assert_eq!(smbios["chassis_sku"], "SKU-1");
         assert_eq!(smbios["processor_socket_prefix"], "LGA1700");
         assert_eq!(smbios["processor_max_speed"], 5400);
-        assert_eq!(smbios["processor_current_speed"], 3997);
+        // The firmware's value, not the clock /proc/cpuinfo happened to read.
+        assert_eq!(smbios["processor_current_speed"], 3366);
+        assert_eq!(smbios["processor_cores"], 16);
+        assert_eq!(smbios["processor_threads"], 24);
         assert_eq!(smbios["memory_manufacturer"], "Corsair");
         assert_eq!(smbios["memory_part"], "CMK32GX4M2E3200C16");
         assert_eq!(smbios["memory_speed"], 3200);
