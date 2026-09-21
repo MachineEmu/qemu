@@ -202,7 +202,7 @@
               echo "track=unifi-10.2 qemu=$QEMU_SOURCE_VERSION ($QEMU_SOURCE_COMMIT)"
               echo "Fetch:   scripts/fetch-unifi-10.2.sh"
               echo "Build:   scripts/build-unifi-10.2.sh"
-              echo "Analysis: scripts/build-analysis-unifi-10.2.sh"
+              echo "Analysis: scripts/build-analysis-10.2.sh"
             '';
 
             env = {

@@ -1,10 +1,18 @@
-# Analysis QEMU series
+# `analysis-10.2` engine track
 
-This directory is the opt-in patch series for the malware-analysis binary. It
-is intentionally separate from `qemu/patches/`: `scripts/fetch.sh` applies the
-common board series to the pinned QEMU `3e0bcba1ca7d6607ca49a988d165f052a3a53323`
-checkout, while `scripts/build-analysis.sh` applies this series in a dedicated
-source and build directory.
+This track holds the patches that keep the guest from recognizing the
+emulator. They are deliberately separate from the board track: `unifi-10.2`
+under `../unifi-10.2` emulates UniFi hardware that does not otherwise exist,
+while this series removes the evidence that any emulator is present at all.
+A patch belongs here when it exists because a guest looks for a hypervisor,
+and there when it exists because a board has a device.
+
+The two series share one pinned QEMU checkout,
+`3e0bcba1ca7d6607ca49a988d165f052a3a53323`. This one is not standalone: it
+links through the meson hooks the board series adds, so `track.toml` declares
+`unifi-10.2` as its base and `scripts/build-analysis-10.2.sh` applies that
+series first, into a dedicated source and build directory. Both series are
+recorded in the engine manifest, in apply order.
 
 The first profile revision uses QEMU's existing PC, Q35, SMBIOS, ACPI, UUID,
 and MAC options through the validated launch plan, and adds an explicit
@@ -73,8 +81,15 @@ consumers that need to validate a resolved profile or derive clone identity
 without shelling out. The ABI returns owned JSON strings and uses NULL on
 validation failure so callers can abort before applying partial identity.
 
-Future QEMU C hooks are added here with a numbered patch and a test result in
-`docs/qemu/malware-analysis-integration-plan.md`.
+The `analysis-profile acpi-dump` command captures Linux ACPI sysfs metadata,
+checksums, and SHA-256 digests, with `--metadata-only` and `--output-dir`
+modes for keeping raw tables outside the repository. Permission-limited or
+missing host ACPI trees produce a valid empty report rather than weakening the
+profile validation path.
+
+The QEMU C hooks are applied by the numbered patch series and are covered by
+the clean x86_64 build plus a runtime smoke that enables the machine property
+and rejects an invalid resolved network mode before startup.
 
 The source commit and profile revision are recorded in each session's
 `environment.json`; this directory must never be added to the common fetch

@@ -6,7 +6,9 @@ set -euo pipefail
 # refuses a checkout owned by another user.
 repo_dir=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null) ||
     repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-track_dir="$repo_dir/tracks/unifi-10.2"
+# The analysis track reuses this build path with its own descriptor, so the
+# manifest records the series that was actually applied.
+track_dir=${QEMU_TRACK_DIR:-"$repo_dir/tracks/unifi-10.2"}
 source_dir=${QEMU_SOURCE_DIR:-"$repo_dir/.cache/qemu-10.2.4"}
 build_dir=${QEMU_BUILD_DIR:-"$repo_dir/.cache/qemu-build-10.2.4"}
 target_list=${QEMU_TARGET_LIST:-aarch64-softmmu}
@@ -14,7 +16,7 @@ target_binary=${QEMU_TARGET_BINARY:-qemu-system-aarch64}
 
 ensure_u2f_header() {
     local qemu_source=$1
-    local include_dir header
+    local include_dir header types_header
     include_dir=$(pkg-config --variable=includedir u2f-emu 2>/dev/null || true)
     if [[ -n "$include_dir" && -f "$include_dir/u2f-emu.h" ]]; then
         header="$include_dir/u2f-emu.h"
@@ -24,6 +26,10 @@ ensure_u2f_header() {
     if [[ -n "${header:-}" ]]; then
         mkdir -p "$qemu_source/include/u2f-emu"
         ln -sfn "$header" "$qemu_source/include/u2f-emu/u2f-emu.h"
+        types_header="${header%/*}/u2f-emu-types.h"
+        if [[ -f "$types_header" ]]; then
+            ln -sfn "$types_header" "$qemu_source/include/u2f-emu/u2f-emu-types.h"
+        fi
     fi
 }
 
@@ -172,6 +178,7 @@ python3 "$repo_dir/scripts/write_engine_manifest.py" \
     --track "$track_dir" \
     --source-revision "$source_revision" \
     --binary "$binary_path" \
+    --target "$target_list" \
     --output "$build_dir/engine-build.json"
 echo "$binary_path"
 echo "$build_dir/engine-build.json"

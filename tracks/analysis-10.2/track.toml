@@ -1,0 +1,30 @@
+schema_version = 1
+id = "analysis-10.2"
+engine = "qemu"
+status = "experimental"
+targets = ["x86_64-softmmu"]
+features = ["analysis-profile", "platform-identity"]
+patch_series = "series"
+patch_root = "patches"
+integration_root = "integration/hw/unifi"
+
+# This series only removes the emulator's fingerprints; it does not build a
+# machine. The board track owns the meson hooks it links through
+# (`unifi_board_lib`, the `hw/unifi` subdir), so its series is applied first,
+# and both series are recorded in the engine manifest.
+[base]
+track = "unifi-10.2"
+
+[source]
+url = "https://gitlab.com/qemu-project/qemu.git"
+revision = "3e0bcba1ca7d6607ca49a988d165f052a3a53323"
+version = "10.2.4"
+verification = "immutable-git-commit"
+
+[toolchain]
+build_script = "scripts/build-analysis-10.2.sh"
+fetch_script = "scripts/build-analysis-10.2.sh"
+
+[compatibility]
+machines = ["q35"]
+host_architectures = ["x86_64-linux"]

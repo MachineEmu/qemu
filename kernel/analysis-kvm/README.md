@@ -13,7 +13,7 @@ The HikaruChang Proxmox approach is mostly a DKMS-like QEMU rebuild wrapper:
 it patches device strings, SMBIOS, ACPI, EDID, USB defaults, and VMGENID at
 QEMU source level. Its own compatibility notes call timing side channels out as
 requiring a host kernel patch. Our repo already handles the QEMU side with
-`qemu/analysis-patches`; this directory is the matching place for the host
+`tracks/analysis-10.2`; this directory is the matching place for the host
 kernel side.
 
 ## Current state
