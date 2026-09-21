@@ -83,9 +83,20 @@ validation failure so callers can abort before applying partial identity.
 
 `analysis-profile host-clone <seed>` builds a profile from the machine it runs
 on, so a guest reports the hardware model of a real host instead of a
-hand-written identity. It reads DMI, `/proc/cpuinfo`, the DSDT (or FACP) ACPI
-header, the host bridge's PCI subsystem IDs, block device vendor/model, the
-display EDID, and thermal and fan readings.
+hand-written identity. It reads the DMI attributes and the raw SMBIOS table,
+`/proc/cpuinfo`, the DSDT (or FACP) ACPI header, PCI and USB device IDs, block
+device vendor/model, the display EDID, network interfaces, and thermal and fan
+readings.
+
+Two of those sources are root-only: the ACPI tables and the raw SMBIOS table
+at `/sys/firmware/dmi/tables/DMI`. The raw table is where the memory modules,
+the processor's socket and speed ceiling, and the chassis asset tag live --
+`/sys/class/dmi/id` publishes none of them -- so an unprivileged run produces a
+thinner profile and says so.
+
+Identifiers are written the way `lspci` and `lsusb` write them: the inventory
+carries `"vendor_id": "0x8086"`, while `analysis.pci` keeps the numeric form
+that QEMU's properties take.
 
 What it deliberately does not copy is the identity that is unique to one
 machine: the system UUID, MAC and DMI serial numbers stay derived from the

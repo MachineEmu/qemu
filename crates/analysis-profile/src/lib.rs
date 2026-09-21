@@ -492,6 +492,187 @@ fn host_smbios(root: &Path) -> serde_json::Map<String, Value> {
     smbios
 }
 
+/// One SMBIOS structure: its type, the fixed-size formatted area, and the
+/// strings that follow it.
+struct DmiStructure {
+    kind: u8,
+    data: Vec<u8>,
+    strings: Vec<String>,
+}
+
+impl DmiStructure {
+    /// SMBIOS string references are 1-based indices into the string set, with
+    /// 0 meaning "not set".
+    fn text(&self, offset: usize) -> Option<String> {
+        let index = *self.data.get(offset)? as usize;
+        let value = self.strings.get(index.checked_sub(1)?)?.trim();
+        // Firmware that has nothing to say still fills the field in.
+        if value.is_empty()
+            || value.contains('\0')
+            || ["Not Specified", "To Be Filled By O.E.M.", "None", "Unknown"].contains(&value)
+        {
+            return None;
+        }
+        Some(value.to_owned())
+    }
+
+    fn word(&self, offset: usize) -> Option<u64> {
+        let bytes = self.data.get(offset..offset + 2)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]) as u64)
+    }
+}
+
+/// Split the raw SMBIOS table into structures.
+///
+/// Each structure is a header, a formatted area whose length the header gives,
+/// and a double-NUL-terminated string set. The table is exactly what firmware
+/// wrote, so a malformed length ends the walk rather than indexing past it.
+fn parse_dmi(data: &[u8]) -> Vec<DmiStructure> {
+    let mut structures = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let kind = data[offset];
+        let length = data[offset + 1] as usize;
+        if length < 4 || offset + length > data.len() {
+            break;
+        }
+        let formatted = data[offset..offset + length].to_vec();
+        let mut cursor = offset + length;
+        let mut strings = Vec::new();
+        let mut current = Vec::new();
+        while cursor < data.len() {
+            if data[cursor] == 0 {
+                if current.is_empty() {
+                    cursor += 1;
+                    break;
+                }
+                strings.push(String::from_utf8_lossy(&current).into_owned());
+                current.clear();
+            } else {
+                current.push(data[cursor]);
+            }
+            cursor += 1;
+        }
+        structures.push(DmiStructure {
+            kind,
+            data: formatted,
+            strings,
+        });
+        // End-of-table marker.
+        if kind == 127 {
+            break;
+        }
+        offset = cursor;
+    }
+    structures
+}
+
+fn read_dmi(root: &Path) -> Vec<DmiStructure> {
+    // Root-only on every distribution, which is why the sysfs DMI attributes
+    // are read separately and this is treated as a bonus.
+    fs::read(root.join("sys/firmware/dmi/tables/DMI"))
+        .map(|data| parse_dmi(&data))
+        .unwrap_or_default()
+}
+
+/// SMBIOS fields that `/sys/class/dmi/id` does not expose.
+///
+/// The kernel publishes a handful of DMI attributes as files; the memory
+/// modules, the processor's socket and speed ceiling, and the chassis asset
+/// tag exist only in the raw table. Serial numbers and the system UUID are in
+/// there too and are deliberately not read.
+fn dmi_smbios(structures: &[DmiStructure]) -> serde_json::Map<String, Value> {
+    let mut smbios = serde_json::Map::new();
+    if let Some(chassis) = structures.iter().find(|item| item.kind == 3) {
+        insert_string(&mut smbios, "chassis_asset", chassis.text(8));
+        insert_string(&mut smbios, "chassis_sku", chassis.text(0x15));
+    }
+    if let Some(processor) = structures.iter().find(|item| item.kind == 4) {
+        insert_string(&mut smbios, "processor_socket_prefix", processor.text(4));
+        insert_string(&mut smbios, "processor_manufacturer", processor.text(7));
+        insert_string(&mut smbios, "processor_version", processor.text(0x10));
+        insert_string(&mut smbios, "processor_asset", processor.text(0x21));
+        insert_string(&mut smbios, "processor_part", processor.text(0x22));
+        for (key, offset) in [
+            ("processor_max_speed", 0x14),
+            ("processor_current_speed", 0x16),
+        ] {
+            if let Some(speed) = processor.word(offset).filter(|speed| *speed > 0) {
+                smbios.insert(key.into(), Value::from(speed));
+            }
+        }
+    }
+    // A machine has one memory profile but many modules; the first populated
+    // one names the part the guest reports.
+    if let Some(memory) = structures
+        .iter()
+        .filter(|item| item.kind == 17)
+        .find(|item| item.word(0x0C).is_some_and(|size| size > 0))
+    {
+        insert_string(&mut smbios, "memory_manufacturer", memory.text(0x17));
+        insert_string(&mut smbios, "memory_asset", memory.text(0x19));
+        insert_string(&mut smbios, "memory_part", memory.text(0x1A));
+        insert_string(&mut smbios, "memory_locator_prefix", memory.text(0x10));
+        insert_string(&mut smbios, "memory_bank", memory.text(0x11));
+        // Offset 0x15 is the rated speed; 0x20 is what it is clocked at.
+        if let Some(speed) = memory
+            .word(0x20)
+            .filter(|speed| *speed > 0)
+            .or_else(|| memory.word(0x15))
+            .filter(|speed| *speed > 0)
+        {
+            smbios.insert("memory_speed".into(), Value::from(speed));
+        }
+    }
+    smbios
+}
+
+/// Every populated memory slot, for the same reason the other lists are kept.
+fn dmi_memory_devices(structures: &[DmiStructure]) -> Vec<Value> {
+    let mut devices = Vec::new();
+    for memory in structures.iter().filter(|item| item.kind == 17) {
+        // Size 0 marks an empty slot. 0x7FFF means "see the 32-bit extended
+        // size at 0x1C", which is how modules of 32GiB and above are reported.
+        let size = memory.word(0x0C).unwrap_or(0);
+        let mut item = serde_json::Map::new();
+        insert_string(&mut item, "locator", memory.text(0x10));
+        insert_string(&mut item, "bank", memory.text(0x11));
+        if size == 0 {
+            item.insert("populated".into(), Value::Bool(false));
+            devices.push(Value::Object(item));
+            continue;
+        }
+        item.insert("populated".into(), Value::Bool(true));
+        let megabytes = if size == 0x7FFF {
+            memory
+                .data
+                .get(0x1C..0x20)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("fixed width")) as u64)
+                .unwrap_or(0)
+        } else if size & 0x8000 != 0 {
+            // Bit 15 set means the value is in kilobytes.
+            (size & 0x7FFF) / 1024
+        } else {
+            size
+        };
+        if megabytes > 0 {
+            item.insert("size_mb".into(), Value::from(megabytes));
+        }
+        for (key, offset) in [("rated_speed_mts", 0x15), ("configured_speed_mts", 0x20)] {
+            if let Some(speed) = memory.word(offset).filter(|speed| *speed > 0) {
+                item.insert(key.into(), Value::from(speed));
+            }
+        }
+        insert_string(&mut item, "manufacturer", memory.text(0x17));
+        insert_string(&mut item, "part", memory.text(0x1A));
+        if let Some(kind) = memory.data.get(0x12) {
+            item.insert("memory_type".into(), Value::from(*kind));
+        }
+        devices.push(Value::Object(item));
+    }
+    devices
+}
+
 /// ACPI header identity, read from the table the host's own firmware wrote.
 ///
 /// DSDT is preferred because every x86 firmware emits one and OEMs brand it;
@@ -551,6 +732,17 @@ fn file_name(path: &Path) -> String {
 
 fn hex_id(path: &Path) -> Option<u64> {
     let value = host_string(path)?;
+    u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+}
+
+/// PCI and USB identifiers are universally written in hex; printing 32902 for
+/// 0x8086 makes an inventory that nobody can read against lspci or lsusb.
+fn hex_value(value: u64, digits: usize) -> Value {
+    Value::String(format!("0x{value:0digits$x}"))
+}
+
+fn hex_field(item: &Value, key: &str) -> Option<u64> {
+    let value = item.get(key)?.as_str()?;
     u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
 }
 
@@ -708,15 +900,15 @@ fn host_pci_devices(root: &Path) -> Vec<Value> {
     for path in sorted_dir(&root.join("sys/bus/pci/devices")) {
         let mut item = serde_json::Map::new();
         item.insert("slot".into(), Value::String(file_name(&path)));
-        for (key, file) in [
-            ("vendor_id", "vendor"),
-            ("device_id", "device"),
-            ("subsystem_vendor_id", "subsystem_vendor"),
-            ("subsystem_id", "subsystem_device"),
-            ("class", "class"),
+        for (key, file, digits) in [
+            ("vendor_id", "vendor", 4),
+            ("device_id", "device", 4),
+            ("subsystem_vendor_id", "subsystem_vendor", 4),
+            ("subsystem_id", "subsystem_device", 4),
+            ("class", "class", 6),
         ] {
             if let Some(value) = hex_id(&path.join(file)) {
-                item.insert(key.into(), Value::from(value));
+                item.insert(key.into(), hex_value(value, digits));
             }
         }
         if let Ok(driver) = fs::read_link(path.join("driver")) {
@@ -737,12 +929,12 @@ fn host_usb_devices(root: &Path) -> Vec<Value> {
         };
         let mut item = serde_json::Map::new();
         item.insert("path".into(), Value::String(file_name(&path)));
-        item.insert("vendor_id".into(), Value::from(vendor));
+        item.insert("vendor_id".into(), hex_value(vendor, 4));
         if let Some(product) = hex_id(&path.join("idProduct")) {
-            item.insert("product_id".into(), Value::from(product));
+            item.insert("product_id".into(), hex_value(product, 4));
         }
         if let Some(bcd) = hex_id(&path.join("bcdDevice")) {
-            item.insert("bcd_device".into(), Value::from(bcd));
+            item.insert("bcd_device".into(), hex_value(bcd, 4));
         }
         insert_string(
             &mut item,
@@ -896,8 +1088,8 @@ fn field<'a>(item: &'a Value, key: &str) -> Option<&'a Value> {
 fn pci_defaults(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
     let devices = inventory["pci_devices"].as_array().expect("array");
     let usable = |device: &&Value| {
-        field(device, "subsystem_vendor_id").and_then(Value::as_u64) > Some(0)
-            && field(device, "subsystem_id").is_some()
+        hex_field(device, "subsystem_vendor_id").is_some_and(|value| value > 0)
+            && hex_field(device, "subsystem_id").is_some()
     };
     let chosen = devices
         .iter()
@@ -905,11 +1097,12 @@ fn pci_defaults(inventory: &serde_json::Map<String, Value>) -> serde_json::Map<S
         .or_else(|| devices.iter().find(usable));
     let mut pci = serde_json::Map::new();
     if let Some(device) = chosen {
-        pci.insert(
-            "subsystem_vendor_id".into(),
-            device["subsystem_vendor_id"].clone(),
-        );
-        pci.insert("subsystem_id".into(), device["subsystem_id"].clone());
+        // QEMU's properties take numbers; only the inventory is written in hex.
+        for key in ["subsystem_vendor_id", "subsystem_id"] {
+            if let Some(value) = hex_field(device, key) {
+                pci.insert(key.into(), Value::from(value));
+            }
+        }
         pci.insert("source_slot".into(), device["slot"].clone());
     }
     pci
@@ -1053,9 +1246,20 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
     analysis.insert("enabled".into(), Value::Bool(true));
     analysis.insert("profile".into(), Value::String("malware-analysis".into()));
     analysis.insert("identity_seed".into(), Value::String(seed.to_owned()));
-    let inventory = host_inventory(root);
+    let dmi = read_dmi(root);
+    let mut inventory = host_inventory(root);
+    inventory.insert(
+        "memory_devices".into(),
+        Value::Array(dmi_memory_devices(&dmi)),
+    );
+    let mut smbios = host_smbios(root);
+    // The sysfs attributes win where both have the field: they are what the
+    // kernel itself reports, and the raw table only fills the gaps.
+    for (key, value) in dmi_smbios(&dmi) {
+        smbios.entry(key).or_insert(value);
+    }
     for (key, value) in [
-        ("smbios", host_smbios(root)),
+        ("smbios", smbios),
         ("acpi", host_acpi(root)),
         ("pci", pci_defaults(&inventory)),
         (
@@ -1098,7 +1302,7 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
     // ACPI tables are root-only on most distributions, and a container may
     // have no DMI at all. Name the sections that came back empty: silence here
     // otherwise reads as a host that simply has no such hardware.
-    let unread: Vec<Value> = ["smbios", "acpi", "pci", "device_descriptors", "sensors"]
+    let mut unread: Vec<Value> = ["smbios", "acpi", "pci", "device_descriptors", "sensors"]
         .into_iter()
         .filter(|key| {
             profile["analysis"][key]
@@ -1107,6 +1311,11 @@ pub fn host_clone(root: &Path, seed: &str) -> Result<Value, ProfileError> {
         })
         .map(|key| Value::String(key.into()))
         .collect();
+    // The raw SMBIOS table is the other root-only source, and the only one
+    // that carries the memory modules and the processor's socket.
+    if dmi.is_empty() {
+        unread.push(Value::String("dmi".into()));
+    }
     // Everything the host reported, so the choices above can be revisited
     // without going back to the machine.
     profile.insert("inventory".into(), Value::Object(inventory));
@@ -1129,6 +1338,31 @@ pub fn host_clone_json(root: &Path, seed: &str) -> Result<String, ProfileError> 
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Build one SMBIOS structure: a header, a formatted area with the given
+    /// bytes placed at their offsets, and the string set.
+    fn dmi_structure(
+        kind: u8,
+        length: usize,
+        fields: &[(usize, &[u8])],
+        strings: &[&str],
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; length];
+        data[0] = kind;
+        data[1] = length as u8;
+        for (offset, bytes) in fields {
+            data[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+        }
+        for text in strings {
+            data.extend_from_slice(text.as_bytes());
+            data.push(0);
+        }
+        if strings.is_empty() {
+            data.push(0);
+        }
+        data.push(0);
+        data
+    }
 
     fn fixture_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1324,7 +1558,13 @@ mod tests {
         assert_eq!(analysis["acpi"]["oem_table_id"], "TP-N32");
         assert_eq!(analysis["acpi"]["creator_id"], "ACPI");
         assert_eq!(analysis["acpi"]["oem_table_id"], "TP-N32");
+        // QEMU's properties take numbers; the inventory is written the way
+        // lspci and lsusb write it.
         assert_eq!(analysis["pci"]["subsystem_vendor_id"], 0x17aa);
+        assert_eq!(
+            profile["inventory"]["pci_devices"][0]["subsystem_vendor_id"],
+            "0x17aa"
+        );
         // Everything the host reported is kept, and the profile picks from it:
         // the connected monitor, and a fixed disk over removable media.
         let inventory = &profile["inventory"];
@@ -1378,6 +1618,94 @@ mod tests {
         assert_eq!(profile["analysis"]["smbios"], serde_json::json!({}));
         assert_eq!(profile["vcpu"], 1);
         assert!(validate_json(&serde_json::to_string(&profile).unwrap()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn raw_dmi_table_fills_what_sysfs_does_not_expose() {
+        let root = fixture_root("host-clone-dmi");
+        let tables = root.join("sys/firmware/dmi/tables");
+        std::fs::create_dir_all(&tables).unwrap();
+        let mut table = Vec::new();
+        table.extend(dmi_structure(
+            3,
+            0x16,
+            &[(8, &[1]), (0x15, &[2])],
+            &["CHASSIS-ASSET", "SKU-1"],
+        ));
+        table.extend(dmi_structure(
+            4,
+            0x30,
+            &[
+                (4, &[1]),
+                (7, &[2]),
+                (0x10, &[3]),
+                (0x14, &5400u16.to_le_bytes()),
+                (0x16, &3997u16.to_le_bytes()),
+                (0x22, &[4]),
+            ],
+            &[
+                "LGA1700",
+                "Intel(R) Corporation",
+                "13th Gen Intel(R) Core(TM) i7-13700K",
+                // Firmware that has nothing to say still fills the field in.
+                "To Be Filled By O.E.M.",
+            ],
+        ));
+        table.extend(dmi_structure(
+            17,
+            0x54,
+            &[
+                // 0x7FFF means "read the 32-bit size at 0x1C", which is how a
+                // module of 32GiB is reported.
+                (0x0C, &0x7FFFu16.to_le_bytes()),
+                (0x10, &[1]),
+                (0x11, &[2]),
+                (0x12, &[26]),
+                (0x15, &3200u16.to_le_bytes()),
+                (0x17, &[3]),
+                (0x18, &[4]),
+                (0x1A, &[5]),
+                (0x1C, &32768u32.to_le_bytes()),
+                (0x20, &3200u16.to_le_bytes()),
+            ],
+            &[
+                "DIMM 0",
+                "P0 CHANNEL A",
+                "Corsair",
+                // The module's serial, which must not be copied.
+                "DEADBEEF01",
+                "CMK32GX4M2E3200C16",
+            ],
+        ));
+        table.extend(dmi_structure(17, 0x54, &[(0x10, &[1])], &["DIMM 1"]));
+        table.extend(dmi_structure(127, 4, &[], &[]));
+        std::fs::write(tables.join("DMI"), &table).unwrap();
+
+        let profile = host_clone(&root, "seed").unwrap();
+        let smbios = &profile["analysis"]["smbios"];
+        assert_eq!(smbios["chassis_asset"], "CHASSIS-ASSET");
+        assert_eq!(smbios["chassis_sku"], "SKU-1");
+        assert_eq!(smbios["processor_socket_prefix"], "LGA1700");
+        assert_eq!(smbios["processor_max_speed"], 5400);
+        assert_eq!(smbios["processor_current_speed"], 3997);
+        assert_eq!(smbios["memory_manufacturer"], "Corsair");
+        assert_eq!(smbios["memory_part"], "CMK32GX4M2E3200C16");
+        assert_eq!(smbios["memory_speed"], 3200);
+        // "To Be Filled By O.E.M." is not an identity.
+        assert!(smbios.get("processor_part").is_none());
+
+        let modules = profile["inventory"]["memory_devices"].as_array().unwrap();
+        assert_eq!(modules.len(), 2);
+        assert_eq!(modules[0]["locator"], "DIMM 0");
+        assert_eq!(modules[0]["size_mb"], 32768);
+        assert_eq!(modules[0]["configured_speed_mts"], 3200);
+        assert_eq!(modules[0]["populated"], true);
+        assert_eq!(modules[1]["populated"], false);
+        assert!(
+            !serde_json::to_string(&profile)
+                .unwrap()
+                .contains("DEADBEEF01")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
