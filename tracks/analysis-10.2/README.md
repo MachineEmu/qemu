@@ -112,16 +112,27 @@ machine. That guest is an exact twin, which also means it collides with the
 host on the same network and reports the host's real identifiers if it phones
 home, so nothing produces it by default.
 
-From the raw SMBIOS table the inventory also keeps the structures no profile
-field covers yet: the cache topology, the board's slots and onboard devices by
-bus address, the port connectors, the TPM's vendor and firmware revision, and
-the memory array's capacity and slot count. None of it is applied to the
-emulated machine today. It is captured because deciding what a convincing
-guest needs is easier against a real machine's table than from memory, and
-because re-taking a capture means going back to the host. Enumerated fields
-are recorded as their SMBIOS codes rather than as names: those enumerations
-grow with every socket and connector, and a guessed mapping would state the
-wrong hardware with confidence.
+Everything the firmware says about itself lives under `inventory.dmi`, grouped
+by structure the way `dmidecode` prints it: `bios`, `system`, `baseboard`,
+`chassis`, `processor`, `caches`, `slots`, `onboard_devices`,
+`port_connectors`, `memory_array`, `memory_devices` and `tpm`. Where the raw
+table is unreadable, the sysfs attributes fill in what they cover. Most of it
+is not applied to the emulated machine. It is captured because deciding what a
+convincing guest needs is easier against a real machine's table than from
+memory, and because re-taking a capture means going back to the host.
+
+Enumerated fields carry both the code the firmware wrote and its name, from
+`src/dmi_names.rs` -- the tables in dmidecode 3.7, which mirror DMTF DSP0134,
+written out rather than mapped by hand. So a processor reports
+`upgrade: 64, upgrade_name: "Socket LGA1700"` where offset 4 only gives the
+board's designator for the socket, and a module reports
+`memory_type_name: "DDR4"`.
+
+The inventory keeps strings exactly as the firmware wrote them, placeholders
+included: "Default string" in the table is a fact about the machine, and the
+capture would otherwise lose the difference between a field the vendor left
+unset and one that was never there. The profile drops those placeholders,
+because cloning one asserts something untrue about the hardware.
 
 The inventory lists every ACPI table the firmware published, and reports the
 two Windows OEM licensing tables by name. A machine that shipped with Windows 8

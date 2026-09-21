@@ -1,5 +1,7 @@
 //! Deterministic validation and identity generation for analysis profiles.
 
+mod dmi_names;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -535,6 +537,16 @@ struct DmiStructure {
 }
 
 impl DmiStructure {
+    /// The string exactly as the firmware wrote it, placeholders included.
+    /// The inventory is evidence: "Default string" in the table is a fact
+    /// about this machine, and dropping it there loses the distinction between
+    /// a field the firmware left unset and one it never had.
+    fn text_raw(&self, offset: usize) -> Option<String> {
+        let index = *self.data.get(offset)? as usize;
+        let value = self.strings.get(index.checked_sub(1)?)?.trim();
+        (!value.is_empty() && !value.contains('\0')).then(|| value.to_owned())
+    }
+
     /// SMBIOS string references are 1-based indices into the string set, with
     /// 0 meaning "not set".
     fn text(&self, offset: usize) -> Option<String> {
@@ -712,20 +724,189 @@ fn dmi_bus_address(item: &DmiStructure, offset: usize) -> Option<String> {
     ))
 }
 
-/// The structures a guest can read but that no profile field covers yet.
-///
-/// None of this is applied to the emulated machine today. It is captured
-/// because the decision about what a convincing guest needs is easier to make
-/// against a real machine's table than from memory, and re-taking a capture
-/// means going back to the host.
-fn dmi_inventory(structures: &[DmiStructure]) -> serde_json::Map<String, Value> {
-    let mut inventory = serde_json::Map::new();
+/// Record an enumerated field as both the code the firmware wrote and the name
+/// that code stands for.
+fn insert_enum(
+    item: &mut serde_json::Map<String, Value>,
+    key: &str,
+    table: &str,
+    code: Option<u64>,
+) {
+    let Some(code) = code else {
+        return;
+    };
+    item.insert(key.into(), Value::from(code));
+    if let Some(name) = dmi_names::enumeration_name(table, code) {
+        item.insert(format!("{key}_name"), Value::String(name.into()));
+    }
+}
 
-    // Type 7. A stock QEMU guest reports no cache topology at all.
+/// The system UUID, which SMBIOS stores with its first three groups
+/// little-endian.
+fn dmi_uuid(system: &DmiStructure) -> Option<String> {
+    let bytes = system.data.get(8..24)?;
+    if bytes.iter().all(|byte| *byte == 0) || bytes.iter().all(|byte| *byte == 0xFF) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        hex(&[bytes[3], bytes[2], bytes[1], bytes[0]]),
+        hex(&[bytes[5], bytes[4]]),
+        hex(&[bytes[7], bytes[6]]),
+        hex(&bytes[8..10]),
+        hex(&bytes[10..16])
+    ))
+}
+
+/// Everything the firmware describes about itself, grouped the way dmidecode
+/// groups it: one entry per structure type, with the lists in table order.
+///
+/// Most of this is not applied to the emulated machine. It is captured because
+/// deciding what a convincing guest needs is easier against a real machine's
+/// table than from memory, and re-taking a capture means going back to the
+/// host. The sysfs attributes fill in where the raw table is unreadable, which
+/// is the usual case for an unprivileged run.
+fn dmi_groups(root: &Path, structures: &[DmiStructure]) -> serde_json::Map<String, Value> {
+    let dmi = root.join("sys/class/dmi/id");
+    let sysfs = |name: &str| host_string(&dmi.join(name));
+    let find = |kind: u8| structures.iter().find(|item| item.kind == kind);
+    let mut groups = serde_json::Map::new();
+
+    let mut bios = serde_json::Map::new();
+    let structure = find(0);
+    insert_string(
+        &mut bios,
+        "vendor",
+        structure
+            .and_then(|item| item.text_raw(4))
+            .or_else(|| sysfs("bios_vendor")),
+    );
+    insert_string(
+        &mut bios,
+        "version",
+        structure
+            .and_then(|item| item.text_raw(5))
+            .or_else(|| sysfs("bios_version")),
+    );
+    insert_string(
+        &mut bios,
+        "release_date",
+        structure
+            .and_then(|item| item.text_raw(8))
+            .or_else(|| sysfs("bios_date")),
+    );
+    groups.insert("bios".into(), Value::Object(bios));
+
+    let mut system = serde_json::Map::new();
+    let structure = find(1);
+    for (key, offset, attribute) in [
+        ("manufacturer", 4usize, "sys_vendor"),
+        ("product", 5, "product_name"),
+        ("version", 6, "product_version"),
+        ("serial", 7, "product_serial"),
+        ("sku", 0x19, "product_sku"),
+        ("family", 0x1A, "product_family"),
+    ] {
+        insert_string(
+            &mut system,
+            key,
+            structure
+                .and_then(|item| item.text_raw(offset))
+                .or_else(|| sysfs(attribute)),
+        );
+    }
+    insert_string(
+        &mut system,
+        "uuid",
+        structure
+            .and_then(dmi_uuid)
+            .or_else(|| sysfs("product_uuid")),
+    );
+    groups.insert("system".into(), Value::Object(system));
+
+    let mut baseboard = serde_json::Map::new();
+    let structure = find(2);
+    for (key, offset, attribute) in [
+        ("manufacturer", 4usize, "board_vendor"),
+        ("product", 5, "board_name"),
+        ("version", 6, "board_version"),
+        ("serial", 7, "board_serial"),
+        ("asset_tag", 8, "board_asset_tag"),
+    ] {
+        insert_string(
+            &mut baseboard,
+            key,
+            structure
+                .and_then(|item| item.text_raw(offset))
+                .or_else(|| sysfs(attribute)),
+        );
+    }
+    groups.insert("baseboard".into(), Value::Object(baseboard));
+
+    let mut chassis = serde_json::Map::new();
+    let structure = find(3);
+    for (key, offset, attribute) in [
+        ("manufacturer", 4usize, "chassis_vendor"),
+        ("version", 6, "chassis_version"),
+        ("serial", 7, "chassis_serial"),
+        ("asset_tag", 8, "chassis_asset_tag"),
+        ("sku", 0x15, "chassis_sku"),
+    ] {
+        insert_string(
+            &mut chassis,
+            key,
+            structure
+                .and_then(|item| item.text_raw(offset))
+                .or_else(|| sysfs(attribute)),
+        );
+    }
+    // The chassis type shares its byte with a lock bit.
+    insert_enum(
+        &mut chassis,
+        "chassis_type",
+        "chassis_type",
+        structure
+            .and_then(|item| item.data.get(5))
+            .map(|code| (code & 0x7F) as u64)
+            .or_else(|| sysfs("chassis_type").and_then(|value| value.parse().ok())),
+    );
+    groups.insert("chassis".into(), Value::Object(chassis));
+
+    if let Some(processor) = find(4) {
+        let mut item = serde_json::Map::new();
+        for (key, offset) in [
+            ("socket_designation", 4usize),
+            ("manufacturer", 7),
+            ("version", 0x10),
+            ("serial", 0x20),
+            ("asset_tag", 0x21),
+            ("part_number", 0x22),
+        ] {
+            insert_string(&mut item, key, processor.text_raw(offset));
+        }
+        for (key, offset) in [("max_speed_mhz", 0x14), ("current_speed_mhz", 0x16)] {
+            if let Some(speed) = processor.word(offset).filter(|speed| *speed > 0) {
+                item.insert(key.into(), Value::from(speed));
+            }
+        }
+        insert_enum(
+            &mut item,
+            "upgrade",
+            "processor_upgrade",
+            processor.data.get(0x19).map(|code| *code as u64),
+        );
+        for (key, offset) in [("cores", 0x23), ("threads", 0x25)] {
+            if let Some(count) = processor.data.get(offset).filter(|count| **count > 0) {
+                item.insert(key.into(), Value::from(*count));
+            }
+        }
+        groups.insert("processor".into(), Value::Object(item));
+    }
+
     let mut caches = Vec::new();
     for cache in structures.iter().filter(|item| item.kind == 7) {
         let mut item = serde_json::Map::new();
-        insert_string(&mut item, "designation", cache.text(4));
+        insert_string(&mut item, "designation", cache.text_raw(4));
         if let Some(configuration) = cache.word(5) {
             item.insert("level".into(), Value::from((configuration & 0x7) + 1));
             item.insert("enabled".into(), Value::from(configuration & 0x80 != 0));
@@ -743,34 +924,38 @@ fn dmi_inventory(structures: &[DmiStructure]) -> serde_json::Map<String, Value> 
         if let Some(maximum) = size(7) {
             item.insert("maximum_size_kb".into(), Value::from(maximum));
         }
-        for (key, offset) in [
-            ("error_correction_type", 0x10),
-            ("system_type", 0x11),
-            ("associativity", 0x12),
+        for (key, table, offset) in [
+            ("error_correction_type", "cache_error_correction_type", 0x10),
+            ("system_type", "cache_system_type", 0x11),
+            ("associativity", "cache_associativity", 0x12),
         ] {
-            if let Some(code) = cache.data.get(offset) {
-                item.insert(key.into(), Value::from(*code));
-            }
+            insert_enum(
+                &mut item,
+                key,
+                table,
+                cache.data.get(offset).map(|code| *code as u64),
+            );
         }
         caches.push(Value::Object(item));
     }
-    inventory.insert("caches".into(), Value::Array(caches));
+    groups.insert("caches".into(), Value::Array(caches));
 
-    // Type 9. The board's physical slots, with the bus address each one leads
-    // to; an emulated machine has slots no one ever screwed a card into.
     let mut slots = Vec::new();
     for slot in structures.iter().filter(|item| item.kind == 9) {
         let mut item = serde_json::Map::new();
-        insert_string(&mut item, "designation", slot.text(4));
-        for (key, offset) in [
-            ("slot_type", 5),
-            ("data_bus_width", 6),
-            ("current_usage", 7),
-            ("length", 8),
+        insert_string(&mut item, "designation", slot.text_raw(4));
+        for (key, table, offset) in [
+            ("slot_type", "slot_type", 5),
+            ("data_bus_width", "slot_bus_width", 6),
+            ("current_usage", "slot_current_usage", 7),
+            ("length", "slot_length", 8),
         ] {
-            if let Some(code) = slot.data.get(offset) {
-                item.insert(key.into(), Value::from(*code));
-            }
+            insert_enum(
+                &mut item,
+                key,
+                table,
+                slot.data.get(offset).map(|code| *code as u64),
+            );
         }
         if let Some(id) = slot.word(9) {
             item.insert("slot_id".into(), Value::from(id));
@@ -778,16 +963,20 @@ fn dmi_inventory(structures: &[DmiStructure]) -> serde_json::Map<String, Value> 
         insert_string(&mut item, "bus_address", dmi_bus_address(slot, 0x0D));
         slots.push(Value::Object(item));
     }
-    inventory.insert("slots".into(), Value::Array(slots));
+    groups.insert("slots".into(), Value::Array(slots));
 
-    // Type 41. Which devices the board itself carries, by bus address.
     let mut onboard = Vec::new();
     for device in structures.iter().filter(|item| item.kind == 41) {
         let mut item = serde_json::Map::new();
-        insert_string(&mut item, "designation", device.text(4));
+        insert_string(&mut item, "designation", device.text_raw(4));
         if let Some(kind) = device.data.get(5) {
             // The top bit is the enabled flag; the rest is the device type.
-            item.insert("device_type".into(), Value::from(kind & 0x7F));
+            insert_enum(
+                &mut item,
+                "device_type",
+                "onboard_device_type",
+                Some((kind & 0x7F) as u64),
+            );
             item.insert("enabled".into(), Value::from(kind & 0x80 != 0));
         }
         if let Some(instance) = device.data.get(6) {
@@ -796,32 +985,80 @@ fn dmi_inventory(structures: &[DmiStructure]) -> serde_json::Map<String, Value> 
         insert_string(&mut item, "bus_address", dmi_bus_address(device, 7));
         onboard.push(Value::Object(item));
     }
-    inventory.insert("onboard_devices".into(), Value::Array(onboard));
+    groups.insert("onboard_devices".into(), Value::Array(onboard));
 
-    // Type 8. AMI ships a fixed set of these -- PS/2, serial, TV out -- on
-    // boards that have no such connector. The boilerplate is itself the
-    // fingerprint: every real AMI machine carries it and no plain QEMU guest
-    // does.
+    // AMI ships a fixed set of these -- PS/2, serial, TV out -- on boards with
+    // no such connector. The boilerplate is itself the fingerprint: every real
+    // AMI machine carries it and no plain QEMU guest does.
     let mut ports = Vec::new();
     for port in structures.iter().filter(|item| item.kind == 8) {
         let mut item = serde_json::Map::new();
-        insert_string(&mut item, "internal_designator", port.text(4));
-        insert_string(&mut item, "external_designator", port.text(6));
-        for (key, offset) in [
-            ("internal_connector_type", 5),
-            ("external_connector_type", 7),
-            ("port_type", 8),
+        insert_string(&mut item, "internal_designator", port.text_raw(4));
+        insert_string(&mut item, "external_designator", port.text_raw(6));
+        for (key, table, offset) in [
+            ("internal_connector_type", "port_connector_type", 5),
+            ("external_connector_type", "port_connector_type", 7),
+            ("port_type", "port_type", 8),
         ] {
-            if let Some(code) = port.data.get(offset) {
-                item.insert(key.into(), Value::from(*code));
-            }
+            insert_enum(
+                &mut item,
+                key,
+                table,
+                port.data.get(offset).map(|code| *code as u64),
+            );
         }
         ports.push(Value::Object(item));
     }
-    inventory.insert("port_connectors".into(), Value::Array(ports));
+    groups.insert("port_connectors".into(), Value::Array(ports));
 
-    // Type 43. A guest with no TPM is a guest on no real modern machine.
-    if let Some(tpm) = structures.iter().find(|item| item.kind == 43) {
+    if let Some(array) = find(16) {
+        let mut item = serde_json::Map::new();
+        for (key, table, offset) in [
+            ("location", "memory_array_location", 4usize),
+            ("use", "memory_array_use", 5),
+            (
+                "error_correction_type",
+                "memory_array_error_correction_type",
+                6,
+            ),
+        ] {
+            insert_enum(
+                &mut item,
+                key,
+                table,
+                array.data.get(offset).map(|code| *code as u64),
+            );
+        }
+        // 0x80000000 in the 32-bit field means the real capacity is in the
+        // 64-bit extended field that follows.
+        if let Some(bytes) = array.data.get(7..11) {
+            let capacity = u32::from_le_bytes(bytes.try_into().expect("fixed width"));
+            let kilobytes = if capacity == 0x8000_0000 {
+                array
+                    .data
+                    .get(0x0F..0x17)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("fixed width")))
+                    .unwrap_or(0)
+            } else {
+                capacity as u64
+            };
+            if kilobytes > 0 {
+                item.insert("maximum_capacity_mb".into(), Value::from(kilobytes / 1024));
+            }
+        }
+        if let Some(devices) = array.word(0x0D) {
+            item.insert("device_slots".into(), Value::from(devices));
+        }
+        groups.insert("memory_array".into(), Value::Object(item));
+    }
+
+    groups.insert(
+        "memory_devices".into(),
+        Value::Array(dmi_memory_devices(structures)),
+    );
+
+    // A guest with no TPM is a guest on no real modern machine.
+    if let Some(tpm) = find(43) {
         let mut item = serde_json::Map::new();
         if let Some(vendor) = tpm.data.get(4..8) {
             let vendor: String = vendor
@@ -851,47 +1088,11 @@ fn dmi_inventory(structures: &[DmiStructure]) -> serde_json::Map<String, Value> 
                 );
             }
         }
-        insert_string(&mut item, "description", tpm.text(0x12));
-        inventory.insert("tpm".into(), Value::Object(item));
+        insert_string(&mut item, "description", tpm.text_raw(0x12));
+        groups.insert("tpm".into(), Value::Object(item));
     }
 
-    // Type 16. How much memory the board can hold and in how many slots,
-    // which is the DIMM count a guest cross-checks its modules against.
-    if let Some(array) = structures.iter().find(|item| item.kind == 16) {
-        let mut item = serde_json::Map::new();
-        for (key, offset) in [
-            ("location", 4usize),
-            ("use", 5),
-            ("error_correction_type", 6),
-        ] {
-            if let Some(code) = array.data.get(offset) {
-                item.insert(key.into(), Value::from(*code));
-            }
-        }
-        // 0x80000000 in the 32-bit field means the real capacity is in the
-        // 64-bit extended field that follows.
-        if let Some(bytes) = array.data.get(7..11) {
-            let capacity = u32::from_le_bytes(bytes.try_into().expect("fixed width"));
-            let kilobytes = if capacity == 0x8000_0000 {
-                array
-                    .data
-                    .get(0x0F..0x17)
-                    .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("fixed width")))
-                    .unwrap_or(0)
-            } else {
-                capacity as u64
-            };
-            if kilobytes > 0 {
-                item.insert("maximum_capacity_mb".into(), Value::from(kilobytes / 1024));
-            }
-        }
-        if let Some(devices) = array.word(0x0D) {
-            item.insert("device_slots".into(), Value::from(devices));
-        }
-        inventory.insert("memory_array".into(), Value::Object(item));
-    }
-
-    inventory
+    groups
 }
 
 /// Every populated memory slot, for the same reason the other lists are kept.
@@ -932,9 +1133,18 @@ fn dmi_memory_devices(structures: &[DmiStructure]) -> Vec<Value> {
         }
         insert_string(&mut item, "manufacturer", memory.text(0x17));
         insert_string(&mut item, "part", memory.text(0x1A));
-        if let Some(kind) = memory.data.get(0x12) {
-            item.insert("memory_type".into(), Value::from(*kind));
-        }
+        insert_enum(
+            &mut item,
+            "memory_type",
+            "memory_device_type",
+            memory.data.get(0x12).map(|code| *code as u64),
+        );
+        insert_enum(
+            &mut item,
+            "form_factor",
+            "memory_device_form_factor",
+            memory.data.get(0x0E).map(|code| *code as u64),
+        );
         devices.push(Value::Object(item));
     }
     devices
@@ -1753,13 +1963,9 @@ pub fn host_clone(root: &Path, seed: Option<&str>) -> Result<Value, ProfileError
     }
     let dmi = read_dmi(root);
     let mut inventory = host_inventory(root);
-    inventory.insert(
-        "memory_devices".into(),
-        Value::Array(dmi_memory_devices(&dmi)),
-    );
-    for (key, value) in dmi_inventory(&dmi) {
-        inventory.insert(key, value);
-    }
+    // Everything the firmware says about itself lives under one key, grouped
+    // by structure the way dmidecode prints it.
+    inventory.insert("dmi".into(), Value::Object(dmi_groups(root, &dmi)));
     let mut smbios = host_smbios(root);
     // The sysfs attributes win where both have the field: they are what the
     // kernel itself reports, and the raw table only fills the gaps.
@@ -2146,13 +2352,16 @@ mod tests {
         assert_eq!(sensors["critical_celsius"], 100);
         assert!(sensors.get("passive_celsius").is_none());
         assert_eq!(profile["vcpu"], 2);
-        // The host's serial and UUID must not reach the profile in any form.
+        // The host's serials and UUID are evidence, so the inventory keeps
+        // them; what must never carry them is the profile the guest runs with.
         let text = serde_json::to_string(&profile).unwrap();
-        assert!(!text.contains("PF2ABCDE"));
-        assert!(!profile["analysis"].to_string().contains("S7DPNU0X909340K"));
-        assert!(!text.contains("3f2504e0"));
-        // Nor may the monitor's own serial, from the 0xFF descriptor.
-        assert!(!text.contains("2Y4XS63"));
+        let analysis_text = analysis.to_string();
+        assert!(!analysis_text.contains("PF2ABCDE"));
+        assert!(!analysis_text.contains("3f2504e0"));
+        // Nor the monitor's own serial, from the EDID 0xFF descriptor.
+        assert!(!analysis_text.contains("2Y4XS63"));
+        assert!(!analysis_text.contains("S7DPNU0X909340K"));
+        assert_eq!(profile["inventory"]["dmi"]["system"]["serial"], "PF2ABCDE");
 
         // The clone is an ordinary profile input: it validates, and the
         // identity it resolves to is the seed's, not the host's.
@@ -2321,38 +2530,49 @@ mod tests {
         // "To Be Filled By O.E.M." is not an identity.
         assert!(smbios.get("processor_part").is_none());
 
-        let inventory = &profile["inventory"];
+        let dmi = &profile["inventory"]["dmi"];
         assert_eq!(smbios["processor_upgrade_code"], 0x40);
-        let cache = &inventory["caches"][0];
+        // Enumerated fields carry the code the firmware wrote and the name it
+        // stands for.
+        assert_eq!(dmi["processor"]["upgrade"], 0x40);
+        assert_eq!(dmi["processor"]["upgrade_name"], "Socket LGA1700");
+        assert_eq!(dmi["processor"]["socket_designation"], "LGA1700");
+        assert_eq!(dmi["processor"]["cores"], 16);
+        let cache = &dmi["caches"][0];
         assert_eq!(cache["designation"], "L3 Cache");
         assert_eq!(cache["level"], 3);
         assert_eq!(cache["installed_size_kb"], 30720);
+        assert_eq!(cache["associativity_name"], "8-way Set-associative");
         assert_eq!(cache["enabled"], true);
-        let slot = &inventory["slots"][0];
+        let slot = &dmi["slots"][0];
         assert_eq!(slot["designation"], "J6B2");
         assert_eq!(slot["bus_address"], "0000:00:01.0");
-        let onboard = &inventory["onboard_devices"][0];
+        let onboard = &dmi["onboard_devices"][0];
         assert_eq!(onboard["designation"], "Onboard - Video");
         assert_eq!(onboard["device_type"], 3);
+        assert_eq!(onboard["device_type_name"], "Video");
         assert_eq!(onboard["enabled"], true);
         assert_eq!(onboard["bus_address"], "0000:00:02.0");
-        let port = &inventory["port_connectors"][0];
+        let port = &dmi["port_connectors"][0];
         assert_eq!(port["internal_designator"], "J1A1");
         assert_eq!(port["external_designator"], "PS2Mouse");
-        let tpm = &inventory["tpm"];
+        assert_eq!(port["external_connector_type_name"], "PS/2");
+        assert_eq!(port["port_type_name"], "Mouse Port");
+        let tpm = &dmi["tpm"];
         assert_eq!(tpm["vendor_id"], "INTC");
         assert_eq!(tpm["spec_version"], "2.0");
         assert_eq!(tpm["firmware_revision"], "600.18");
         assert_eq!(tpm["description"], "INTEL");
-        let array = &inventory["memory_array"];
+        let array = &dmi["memory_array"];
         assert_eq!(array["maximum_capacity_mb"], 128 * 1024);
         assert_eq!(array["device_slots"], 4);
 
-        let modules = inventory["memory_devices"].as_array().unwrap();
+        let modules = dmi["memory_devices"].as_array().unwrap();
         assert_eq!(modules.len(), 2);
         assert_eq!(modules[0]["locator"], "DIMM 0");
         assert_eq!(modules[0]["size_mb"], 32768);
         assert_eq!(modules[0]["configured_speed_mts"], 3200);
+        assert_eq!(modules[0]["memory_type_name"], "DDR4");
         assert_eq!(modules[0]["populated"], true);
         assert_eq!(modules[1]["populated"], false);
         assert!(
