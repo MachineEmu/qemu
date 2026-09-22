@@ -9,8 +9,8 @@ repo_dir=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/
 # The analysis track reuses this build path with its own descriptor, so the
 # manifest records the series that was actually applied.
 track_dir=${QEMU_TRACK_DIR:-"$repo_dir/tracks/unifi-10.2"}
-source_dir=${QEMU_SOURCE_DIR:-"$repo_dir/.cache/qemu-10.2.4"}
-build_dir=${QEMU_BUILD_DIR:-"$repo_dir/.cache/qemu-build-10.2.4"}
+source_dir=${QEMU_SOURCE_DIR:-"$repo_dir/.cache/qemu-10.2.4-unifi"}
+build_dir=${QEMU_BUILD_DIR:-"$repo_dir/.cache/qemu-build-10.2.4-unifi"}
 target_list=${QEMU_TARGET_LIST:-aarch64-softmmu}
 target_binary=${QEMU_TARGET_BINARY:-qemu-system-aarch64}
 

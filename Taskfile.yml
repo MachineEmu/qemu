@@ -7,7 +7,7 @@ version: '3'
 # entered.
 
 vars:
-  BUILD_DIR: '{{.BUILD_DIR | default ".cache/qemu-build-10.2.4"}}'
+  BUILD_DIR: '{{.BUILD_DIR | default ".cache/qemu-build-10.2.4-unifi"}}'
   ANALYSIS_BUILD_DIR: '{{.ANALYSIS_BUILD_DIR | default ".cache/qemu-build-10.2.4-analysis"}}'
   # .#kernel (unstable), .#kernel-stable, or .#kernel-analysis-stable.
   KERNEL_SHELL: '{{.KERNEL_SHELL | default ".#kernel"}}'

@@ -75,7 +75,7 @@ requested binary as an unknown target.
 After a build, validate the installed bundle before handing it to the runtime:
 
 ```sh
-python3 scripts/validate_engine_bundle.py .cache/qemu-build-10.2.4/engine-build.json
+python3 scripts/validate_engine_bundle.py .cache/qemu-build-10.2.4-unifi/engine-build.json
 ```
 
 Validation rejects incomplete or dirty manifests, path escapes, missing

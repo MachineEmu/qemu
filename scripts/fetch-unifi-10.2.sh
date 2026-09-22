@@ -8,7 +8,7 @@ set -euo pipefail
 repo_dir=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null) ||
     repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 track_dir="$repo_dir/tracks/unifi-10.2"
-source_dir=${QEMU_SOURCE_DIR:-"$repo_dir/.cache/qemu-10.2.4"}
+source_dir=${QEMU_SOURCE_DIR:-"$repo_dir/.cache/qemu-10.2.4-unifi"}
 commit=3e0bcba1ca7d6607ca49a988d165f052a3a53323
 remote=${QEMU_GIT_URL:-https://gitlab.com/qemu-project/qemu.git}
 
