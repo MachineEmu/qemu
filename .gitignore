@@ -1,2 +1,12 @@
 .cache/
 target/
+
+# Kbuild leaves its objects beside the module source.
+kernel/**/*.o
+kernel/**/*.ko
+kernel/**/*.mod
+kernel/**/*.mod.c
+kernel/**/.*.cmd
+kernel/**/Module.symvers
+kernel/**/modules.order
+kernel/**/.tmp_versions/
